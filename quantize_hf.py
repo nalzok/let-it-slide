@@ -17,6 +17,8 @@ def sinkhorn_knopp_factorize(M):
     c = np.ones((1, in_features))
     r = np.ones((out_features, 1))
 
+    # TODO: switch to torch
+    # TODO: make n_iterations smaller
     MM = M**2
     n_iterations = 64
     for _ in range(n_iterations):
@@ -95,6 +97,8 @@ def quantize_model(model, hessian_root, permuted_alphabet):
             U = torch.linalg.cholesky(H, upper=True)
             corrections = jnp.array(U.T * in_scales)
 
+            # rng = np.random.default_rng(42)
+            # permuted_alphabet = rng.choice(normalized.reshape(-1), size=1<<16, replace=False)
             normalized_rounded = round_weights(normalized, corrections, permuted_alphabet)
             recon = out_scales * normalized_rounded * in_scales
             module.weight.copy_(torch.from_numpy(recon))
@@ -103,9 +107,9 @@ def quantize_model(model, hessian_root, permuted_alphabet):
             E = W - torch.from_numpy(recon).float()
             raw = torch.from_numpy(normalized - normalized_rounded).square().mean()
             frob_abs = E.square().mean()
-            frob_rel = E.square().mean() / W.square().mean()
+            frob_rel = frob_abs / W.square().mean()
             proxy_abs = ((E @ H) * E).mean()
-            proxy_rel = ((E @ H) * E).mean() / ((W @ H) * W).mean()
+            proxy_rel = proxy_abs / ((W @ H) * W).mean()
             print(f"{layer=}, {hf_name=}, {raw=:.6g}, {frob_abs=:.6g}, {frob_rel=:.6g}, {proxy_abs=:.6g}, {proxy_rel=:.6f}")
 
 
