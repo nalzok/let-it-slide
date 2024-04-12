@@ -14,19 +14,13 @@ def benchmark():
     compressed = torch.randint(torch.iinfo(torch.int32).max+1, (compressed_m, compressed_n),
                       dtype=torch.int32, device="cuda")
     codebook = torch.randn(1<<16, dtype=torch.float16, device="cuda")
-    out = torch.full((m, n), -1, dtype=torch.float16, device="cuda")
+    decompressed = torch.empty((m, n), dtype=torch.float16, device="cuda")
 
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
-    rptc_kernels.decompress(compressed, codebook, out)
-    end_event.record()
-    torch.cuda.synchronize()
-    elapsed_time_ms = start_event.elapsed_time(end_event) / 1000
-    print(f"Seconds elapsed: {elapsed_time_ms:.4f}")
+    elapsed_time = rptc_kernels.decompress(compressed, codebook, decompressed) / 1000
+    bandwidth = (memory_consumption + m * n * 2) / elapsed_time / 1024**3
+    print(f"Memory Bandwidth (decompress): {bandwidth:.4f} GiB/s")
 
     x = torch.randn((n,), dtype=torch.float16, device="cuda")
-    out = torch.full((m,), -1, dtype=torch.float16, device="cuda")
 
     matvec_list = [
         (16, rptc_kernels.decompress_matvec_16),
@@ -37,14 +31,11 @@ def benchmark():
     ]
 
     for L, decompress_matvec in matvec_list:
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-        decompress_matvec(compressed, codebook[:1<<L], x, out)
-        end_event.record()
-        torch.cuda.synchronize()
-        elapsed_time_ms = start_event.elapsed_time(end_event) / 1000
-        print(f"Seconds elapsed ({L = }): {elapsed_time_ms:.4f}")
+        out = torch.zeros((m,), dtype=torch.float32, device="cuda")
+        elapsed_time = decompress_matvec(compressed, codebook[:1<<L], x, out) / 1000
+        bandwidth = memory_consumption / elapsed_time / 1024**3
+        print(f"Memory Bandwidth (decompress_matvec<{L=}>): {bandwidth:.4f} GiB/s")
+
 
 
 if __name__ == "__main__":

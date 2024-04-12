@@ -10,9 +10,9 @@ setup(
                      "csrc/rptc_kernels/inference.cu"],
             extra_compile_args={
                 # "cxx": ["-g", "-lineinfo"],
-                # "nvcc": ["-O2", "-g", "-Xcompiler", "-rdynamic", "-lineinfo"],
-                "cxx": ["-O3", "-std=c++17"],
-                "nvcc": ["-O3", "-std=c++17"],
+                # "nvcc": ["-O2", "-g", "-Xcompiler", "-rdynamic", "--ptxas-options=-v", "-lineinfo", "-gencode=arch=compute_61,code=sm_61"],
+                "cxx": ["-O3", "-std=c++17", "-lineinfo"],
+                "nvcc": ["-O3", "-std=c++17", "--ptxas-options=-v", "-lineinfo", "-gencode=arch=compute_61,code=sm_61"],
             }
         )
     ],

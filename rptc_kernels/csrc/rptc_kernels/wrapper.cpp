@@ -1,14 +1,14 @@
 #include <torch/extension.h>
 
 
-void decompress(
+float decompress(
     torch::Tensor &compressed,
     torch::Tensor &codebook,
     torch::Tensor &out
 );
 
 
-void decompress_matvec_16(
+float decompress_matvec_16(
     torch::Tensor &compressed,
     torch::Tensor &codebook,
     torch::Tensor &x,
@@ -16,7 +16,7 @@ void decompress_matvec_16(
 );
 
 
-void decompress_matvec_14(
+float decompress_matvec_14(
     torch::Tensor &compressed,
     torch::Tensor &codebook,
     torch::Tensor &x,
@@ -24,7 +24,7 @@ void decompress_matvec_14(
 );
 
 
-void decompress_matvec_12(
+float decompress_matvec_12(
     torch::Tensor &compressed,
     torch::Tensor &codebook,
     torch::Tensor &x,
@@ -32,7 +32,7 @@ void decompress_matvec_12(
 );
 
 
-void decompress_matvec_10(
+float decompress_matvec_10(
     torch::Tensor &compressed,
     torch::Tensor &codebook,
     torch::Tensor &x,
@@ -40,9 +40,16 @@ void decompress_matvec_10(
 );
 
 
-void decompress_matvec_8(
+float decompress_matvec_8(
     torch::Tensor &compressed,
     torch::Tensor &codebook,
+    torch::Tensor &x,
+    torch::Tensor &out
+);
+
+
+float matvec(
+    torch::Tensor &decompressed,
     torch::Tensor &x,
     torch::Tensor &out
 );
@@ -55,4 +62,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("decompress_matvec_12", &decompress_matvec_12, "decompress_matvec_12");
     m.def("decompress_matvec_10", &decompress_matvec_10, "decompress_matvec_10");
     m.def("decompress_matvec_8", &decompress_matvec_8, "decompress_matvec_8");
+    m.def("matvec", &matvec, "matvec");
 }
