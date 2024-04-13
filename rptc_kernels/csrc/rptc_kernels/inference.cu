@@ -372,21 +372,32 @@ matvec_kernel(
     size_t warpId = threadId / warpSize;
     size_t warpCount = gridDim.x * blockDim.x / warpSize;
 
+    constexpr size_t unroll = 1;
+    half2 w[unroll], a[unroll];
+    const half2 *a_base = reinterpret_cast<const half2 *>(x);
+
     for (size_t rowId = warpId; rowId < m; rowId += warpCount) {
+        const half2 *w_base = reinterpret_cast<const half2 *>(decompressed + rowId * n);
+        float inner = 0.0f;
 
-        float inner = 0;
-        for (size_t colId = warpId * warpSize + laneId; colId < n / 2; colId += warpSize) {
-            half2 w = reinterpret_cast<const half2 *>(decompressed + rowId * n)[colId];
-            half2 a = reinterpret_cast<const half2 *>(x)[colId];
+        for (size_t colId = laneId; colId < n / 2 / unroll; colId += warpSize) {
+            #pragma unroll
+            for (size_t i = 0; i < unroll; i += 1) {
+                w[i] = w_base[colId * unroll + i];
+                a[i] = a_base[colId * unroll + i];
+            }
 
-            inner = __fmaf_rn(
-                    __half2float(w.x),
-                    __half2float(a.x),
-                    inner);
-            inner = __fmaf_rn(
-                    __half2float(w.y),
-                    __half2float(a.y),
-                    inner);
+            #pragma unroll
+            for (size_t i = 0; i < unroll; i += 1) {
+                inner = __fmaf_rn(
+                        __half2float(w[i].x),
+                        __half2float(a[i].x),
+                        inner);
+                inner = __fmaf_rn(
+                        __half2float(w[i].y),
+                        __half2float(a[i].y),
+                        inner);
+            }
         }
 
         for (size_t offset = 16; offset > 0; offset /= 2) {
@@ -426,7 +437,7 @@ __host__ extern float matvec(
 
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, decompressed.get_device());
-    size_t grid_size = 8 * static_cast<size_t>(deviceProp.multiProcessorCount);
+    size_t grid_size = 4 * static_cast<size_t>(deviceProp.multiProcessorCount);
     size_t block_size = MAX_THREADS_PER_BLOCK;
 
     cudaStream_t stream;

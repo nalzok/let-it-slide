@@ -32,6 +32,7 @@ def benchmark():
 
     for L, decompress_matvec in matvec_list:
         out = torch.zeros((m,), dtype=torch.float32, device="cuda")
+        _ = decompress_matvec(compressed, codebook[:1<<L], x, out)  # warm up
         elapsed_time = decompress_matvec(compressed, codebook[:1<<L], x, out) / 1000
         bandwidth = memory_consumption / elapsed_time / 1024**3
         print(f"Memory Bandwidth (decompress_matvec<{L=}>): {bandwidth:.4f} GiB/s")
