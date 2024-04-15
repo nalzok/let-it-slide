@@ -25,6 +25,10 @@ using namespace torch::indexing;
 using namespace nvcuda;
 
 #define MAX_THREADS_PER_BLOCK 1024
+#define MIN_BLOCKS_PER_MP 2
+
+constexpr size_t warpsPerRow = 4;
+constexpr size_t prefetch = 16;
 
 #define FULL_MASK 0xFFFFFFFFU
 #define HALF_MASK 0x0000FFFFU
@@ -46,7 +50,7 @@ __host__ static inline void gpuAssert(cudaError_t code, const char *file, int li
 
 
 __global__ static void
-__launch_bounds__(MAX_THREADS_PER_BLOCK)
+__launch_bounds__(MAX_THREADS_PER_BLOCK, MIN_BLOCKS_PER_MP)
 decompress_kernel(
     half *__restrict__ out,
     const uint4 *__restrict__ compressed,
@@ -131,7 +135,7 @@ __host__ extern float decompress(
 
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, compressed.get_device());
-    size_t grid_size = 2 * static_cast<size_t>(deviceProp.multiProcessorCount);
+    size_t grid_size = MIN_BLOCKS_PER_MP * static_cast<size_t>(deviceProp.multiProcessorCount);
     size_t block_size = MAX_THREADS_PER_BLOCK;
 
     cudaStream_t stream;
@@ -168,7 +172,7 @@ __host__ extern float decompress(
 
 template <size_t L>
 __global__ static void
-__launch_bounds__(MAX_THREADS_PER_BLOCK)
+__launch_bounds__(MAX_THREADS_PER_BLOCK, MIN_BLOCKS_PER_MP)
 decompress_matvec_kernel(
     float *__restrict__ out,
     const uint4 *__restrict__ compressed,
@@ -292,7 +296,7 @@ __host__ static float decompress_matvec(
 
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, compressed.get_device());
-    size_t grid_size = 2 * static_cast<size_t>(deviceProp.multiProcessorCount);
+    size_t grid_size = MIN_BLOCKS_PER_MP * static_cast<size_t>(deviceProp.multiProcessorCount);
     size_t block_size = MAX_THREADS_PER_BLOCK;
 
     cudaStream_t stream;
@@ -359,7 +363,7 @@ __host__ extern float decompress_matvec_8(
 
 
 __global__ static void
-__launch_bounds__(MAX_THREADS_PER_BLOCK)
+__launch_bounds__(MAX_THREADS_PER_BLOCK, MIN_BLOCKS_PER_MP)
 matvec_kernel(
     float *__restrict__ out,
     const half *__restrict__ decompressed,
@@ -372,23 +376,26 @@ matvec_kernel(
     size_t warpId = threadId / warpSize;
     size_t warpCount = gridDim.x * blockDim.x / warpSize;
 
-    constexpr size_t unroll = 1;
-    half2 w[unroll], a[unroll];
-    const half2 *a_base = reinterpret_cast<const half2 *>(x);
+    half2 w[prefetch], a[prefetch];
+    const half2 *act = reinterpret_cast<const half2 *>(x);
 
-    for (size_t rowId = warpId; rowId < m; rowId += warpCount) {
-        const half2 *w_base = reinterpret_cast<const half2 *>(decompressed + rowId * n);
+    for (size_t rowId = warpId / warpsPerRow;
+            rowId < m;
+            rowId += warpCount / warpsPerRow) {
+        const half2 *row = reinterpret_cast<const half2 *>(decompressed + rowId * n);
         float inner = 0.0f;
 
-        for (size_t colId = laneId; colId < n / 2 / unroll; colId += warpSize) {
+        for (size_t colId = (warpId % warpsPerRow) * warpSize + laneId;
+                colId < n / 2;
+                colId += prefetch * warpsPerRow * warpSize) {
             #pragma unroll
-            for (size_t i = 0; i < unroll; i += 1) {
-                w[i] = w_base[colId * unroll + i];
-                a[i] = a_base[colId * unroll + i];
+            for (size_t i = 0; i < prefetch; i += 1) {
+                w[i] = row[colId + i * warpsPerRow * warpSize];
+                a[i] = act[colId + i * warpsPerRow * warpSize];
             }
 
             #pragma unroll
-            for (size_t i = 0; i < unroll; i += 1) {
+            for (size_t i = 0; i < prefetch; i += 1) {
                 inner = __fmaf_rn(
                         __half2float(w[i].x),
                         __half2float(a[i].x),
@@ -405,7 +412,7 @@ matvec_kernel(
         }
 
         if (laneId == 0) {
-            out[rowId] = inner;
+            atomicAdd(out + rowId, inner);
         }
     }
 }
@@ -418,7 +425,7 @@ __host__ extern float matvec(
 ) {
     CHECK_INPUT(decompressed);
     TORCH_CHECK(decompressed.dim() == 2);
-    TORCH_CHECK(decompressed.size(1) % 32 == 0);    // each warp has 32 threads, each handling an int4
+    TORCH_CHECK(decompressed.size(1) % (prefetch * warpsPerRow * 32 * 2) == 0); // 32 as in warpSize, 2 as in half2
     TORCH_CHECK(decompressed.scalar_type() == torch::kFloat16);
 
     size_t m = decompressed.size(0);
@@ -437,7 +444,7 @@ __host__ extern float matvec(
 
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, decompressed.get_device());
-    size_t grid_size = 4 * static_cast<size_t>(deviceProp.multiProcessorCount);
+    size_t grid_size = MIN_BLOCKS_PER_MP * static_cast<size_t>(deviceProp.multiProcessorCount);
     size_t block_size = MAX_THREADS_PER_BLOCK;
 
     cudaStream_t stream;

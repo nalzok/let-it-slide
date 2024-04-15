@@ -12,9 +12,12 @@ def benchmark():
 
     decompressed = torch.randn((m, n), dtype=torch.float16, device="cuda")
     x = torch.randn((n,), dtype=torch.float16, device="cuda")
-    out = torch.zeros((m,), dtype=torch.float32, device="cuda")
 
-    _ = rptc_kernels.matvec(decompressed, x, out)   # warm up
+    # warm up
+    out = torch.zeros((m,), dtype=torch.float32, device="cuda")
+    _ = rptc_kernels.matvec(decompressed, x, out)
+
+    out = torch.zeros((m,), dtype=torch.float32, device="cuda")
     elapsed_time = rptc_kernels.matvec(decompressed, x, out) / 1000
     bandwidth = memory_consumption / elapsed_time / 1024**3
     print(f"Nanoseconds Elapsed (matvec): {elapsed_time * 1e9}")
