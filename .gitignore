@@ -289,3 +289,4 @@ tags
 .clangd
 **/report*.sqlite
 **/report*.nsys-rep
+**/*.nsight-cuprof-report
