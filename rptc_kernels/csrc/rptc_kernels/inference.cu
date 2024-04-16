@@ -27,8 +27,10 @@ using namespace nvcuda;
 #define MAX_THREADS_PER_BLOCK 1024
 #define MIN_BLOCKS_PER_MP 2
 
-constexpr size_t warpsPerRow = 4;
-constexpr size_t prefetch = 16;
+constexpr size_t warpsPerRow = 1;
+constexpr size_t prefetch = 2;
+constexpr size_t warpsPerRowMatvec = 4;
+constexpr size_t prefetchMatvec = 16;
 
 #define FULL_MASK 0xFFFFFFFFU
 #define HALF_MASK 0x0000FFFFU
@@ -113,13 +115,13 @@ __host__ extern float decompress(
 ) {
     CHECK_INPUT(compressed);
     TORCH_CHECK(compressed.dim() == 2);
-    TORCH_CHECK(compressed.size(1) % (4 * 32) == 0);    // each warp has 32 threads, each handling an int4
+    TORCH_CHECK(compressed.size(1) % (4 * 32) == 0);    // each warp has 32 threads, each handling an uint4
     TORCH_CHECK(compressed.scalar_type() == torch::kInt32);
 
     size_t compressed_m = compressed.size(0);
     size_t compressed_n = compressed.size(1) / 4;
     size_t m = compressed_m;
-    size_t n = compressed_n * 64;   // at 2 bit, each int4 has 4x32 bits = 4x16 weights
+    size_t n = compressed_n * 64;   // at 2 bit, each uint4 has 4x32 bits = 4x16 weights
 
     CHECK_INPUT(codebook);
     TORCH_CHECK(codebook.dim() == 1);
@@ -174,8 +176,8 @@ template <size_t L>
 __global__ static void
 __launch_bounds__(MAX_THREADS_PER_BLOCK, MIN_BLOCKS_PER_MP)
 decompress_matvec_kernel(
-    float *__restrict__ out,
-    const uint4 *__restrict__ compressed,
+    half *__restrict__ out,
+    const uint32_t *__restrict__ compressed,
     const half *__restrict__ codebook,
     const half *__restrict__ x,
     size_t compressed_m,
@@ -183,14 +185,13 @@ decompress_matvec_kernel(
 ) {
     const half *__restrict__ codebook_ptr = codebook;
 
-    if constexpr (L < 16) {
-        // TODO: what's the lifetime of smem?
-        __shared__ half smem[1<<L];
-        for (int cb_idx = threadIdx.x; cb_idx < (1<<L)/8; cb_idx += blockDim.x) {
-            reinterpret_cast<int4 *>(smem)[cb_idx] = reinterpret_cast<const int4 *>(codebook)[cb_idx];
-        }
-        codebook_ptr = smem;
-    }
+    // if constexpr (L < 16) {
+    //     __shared__ half smem[1<<L];
+    //     for (int cb_idx = threadIdx.x; cb_idx < (1<<L)/8; cb_idx += blockDim.x) {
+    //         reinterpret_cast<uint4 *>(smem)[cb_idx] = reinterpret_cast<const uint4 *>(codebook)[cb_idx];
+    //     }
+    //     codebook_ptr = smem;
+    // }
 
     constexpr uint16_t mask = (1<<L) - 1;
 
@@ -198,62 +199,168 @@ decompress_matvec_kernel(
     size_t laneId = threadIdx.x % warpSize;
     size_t warpId = threadId / warpSize;
     size_t warpCount = gridDim.x * blockDim.x / warpSize;
-    for (size_t rowId = warpId; rowId < compressed_m; rowId += warpCount) {
+    size_t stride = warpsPerRow * warpSize;
 
-        float delta = 0;
-        uint16_t carry = 0; // initial state
-        for (size_t colId = laneId; colId < compressed_n; colId += warpSize) {
-            size_t elemId = rowId * compressed_n + colId;
-            uint4 inputs = compressed[elemId];
+    // each int4 has 4x32 bits, which corresponds to 4x16 weights at 2 bit
+    // both reg_w and reg_a are reused 4 times, hence their sizes
+    uint32_t carries[prefetch];
+    uint4 reg_c[prefetch];
+    half2 reg_w[prefetch][8];
+    half2 reg_a[prefetch][8];
+    half2 inners[prefetch];
 
-            carry = __shfl_up_sync(FULL_MASK, inputs.w, 1);    // laneId == 0 is not updated
+    for (size_t rowId = warpId / warpsPerRow;
+            rowId < compressed_m;
+            rowId += warpCount / warpsPerRow) {
+        const uint4 *row = reinterpret_cast<const uint4 *>(compressed + rowId * compressed_n);
 
-            const half *__restrict__ activations = x + colId * 64;
-
-            #pragma unroll
-            for (int i = 0; i < 16; i += 1) {
-                delta = __fmaf_rn(
-                        __half2float(codebook_ptr[mask & __funnelshift_l(inputs.x, carry, 2*i)]),
-                        __half2float(activations[i]),
-                        delta);
-            }
-
-            activations += 16;
-            #pragma unroll
-            for (int i = 0; i < 16; i += 1) {
-                delta = __fmaf_rn(
-                        __half2float(codebook_ptr[mask & __funnelshift_l(inputs.y, inputs.x, 2*i)]),
-                        __half2float(activations[i]),
-                        delta);
-            }
-
-            activations += 16;
-            #pragma unroll
-            for (int i = 0; i < 16; i += 1) {
-                delta = __fmaf_rn(
-                        __half2float(codebook_ptr[mask & __funnelshift_l(inputs.z, inputs.y, 2*i)]),
-                        __half2float(activations[i]),
-                        delta);
-            }
-
-            activations += 16;
-            #pragma unroll
-            for (int i = 0; i < 16; i += 1) {
-                delta = __fmaf_rn(
-                        __half2float(codebook_ptr[mask & __funnelshift_l(inputs.w, inputs.z, 2*i)]),
-                        __half2float(activations[i]),
-                        delta);
-            }
-
-            carry = __shfl_down_sync(FULL_MASK, inputs.w, 31);    // only laneId == 0 is updated
+        #pragma unroll
+        for (size_t i = 0; i < prefetch; i += 1) {
+            carries[i] = row[(compressed_n + i * warpSize - 1) % compressed_m].w;
+            inners[i] = __float2half2_rn(0.0f);
         }
 
-        for (int offset = 16; offset > 0; offset /= 2) {
-            delta += __shfl_down_sync(FULL_MASK, delta, offset);
+        for (size_t colId = threadId % stride;
+                colId < compressed_n / 4;
+                colId += prefetch * stride) {
+            #pragma unroll
+            for (size_t i = 0; i < prefetch; i += 1) {
+                reg_c[i] = row[colId + i * stride];
+            }
+
+            const half2 *act = reinterpret_cast<const half2 *>(x) + threadId % stride;
+            #pragma unroll
+            for (size_t i = 0; i < prefetch; i += 1) {
+                #pragma unroll
+                for (size_t j = 0; j < 8; j += 1) {
+                    reg_a[i][j] = act[(i*8+j)*stride];
+                }
+            }
+            #pragma unroll
+            for (size_t i = 0; i < prefetch; i += 1) {
+                carries[i] = __shfl_up_sync(FULL_MASK, reg_c[i].w, 1);  // laneId == 0 is not updated
+            }
+            #pragma unroll
+            for (int i = 0; i < prefetch; i += 1) {
+                #pragma unroll
+                for (size_t j = 0; j < 8; j += 1) {
+                    reg_w[i][j] = __halves2half2(
+                            codebook_ptr[mask & __funnelshift_l(reg_c[i].x, carries[i], 4*j)],
+                            codebook_ptr[mask & __funnelshift_l(reg_c[i].x, carries[i], 4*j+2)]);
+                }
+            }
+            #pragma unroll
+            for (size_t j = 0; j < 8; j += 1) {
+                #pragma unroll
+                for (int i = 0; i < prefetch; i += 1) {
+                    // TODO: Kahan summation?
+                    inners[i] = __hfma2(reg_w[i][j], reg_a[i][j], inners[i]);
+                }
+            }
+
+            act += prefetch * 8 * stride;
+            #pragma unroll
+            for (size_t i = 0; i < prefetch; i += 1) {
+                #pragma unroll
+                for (size_t j = 0; j < 8; j += 1) {
+                    reg_a[i][j] = act[(i*8+j)*stride];
+                }
+            }
+            #pragma unroll
+            for (int i = 0; i < prefetch; i += 1) {
+                #pragma unroll
+                for (size_t j = 0; j < 8; j += 1) {
+                    reg_w[i][j] = __halves2half2(
+                            codebook_ptr[mask & __funnelshift_l(reg_c[i].y, reg_c[i].x, 4*j)],
+                            codebook_ptr[mask & __funnelshift_l(reg_c[i].y, reg_c[i].x, 4*j+2)]);
+                }
+            }
+            #pragma unroll
+            for (size_t j = 0; j < 8; j += 1) {
+                #pragma unroll
+                for (int i = 0; i < prefetch; i += 1) {
+                    inners[i] = __hfma2(reg_w[i][j], reg_a[i][j], inners[i]);
+                }
+            }
+
+            act += prefetch * 8 * stride;
+            #pragma unroll
+            for (size_t i = 0; i < prefetch; i += 1) {
+                #pragma unroll
+                for (size_t j = 0; j < 8; j += 1) {
+                    reg_a[i][j] = act[(i*8+j)*stride];
+                }
+            }
+            #pragma unroll
+            for (int i = 0; i < prefetch; i += 1) {
+                #pragma unroll
+                for (size_t j = 0; j < 8; j += 1) {
+                    reg_w[i][j] = __halves2half2(
+                            codebook_ptr[mask & __funnelshift_l(reg_c[i].z, reg_c[i].y, 4*j)],
+                            codebook_ptr[mask & __funnelshift_l(reg_c[i].z, reg_c[i].y, 4*j+2)]);
+                }
+            }
+            #pragma unroll
+            for (size_t j = 0; j < 8; j += 1) {
+                #pragma unroll
+                for (int i = 0; i < prefetch; i += 1) {
+                    inners[i] = __hfma2(reg_w[i][j], reg_a[i][j], inners[i]);
+                }
+            }
+
+            act += prefetch * 8 * stride;
+            #pragma unroll
+            for (size_t i = 0; i < prefetch; i += 1) {
+                #pragma unroll
+                for (size_t j = 0; j < 8; j += 1) {
+                    reg_a[i][j] = act[(i*8+j)*stride];
+                }
+            }
+            #pragma unroll
+            for (int i = 0; i < prefetch; i += 1) {
+                #pragma unroll
+                for (size_t j = 0; j < 8; j += 1) {
+                    reg_w[i][j] = __halves2half2(
+                            codebook_ptr[mask & __funnelshift_l(reg_c[i].w, reg_c[i].z, 4*j)],
+                            codebook_ptr[mask & __funnelshift_l(reg_c[i].w, reg_c[i].z, 4*j+2)]);
+                }
+            }
+            #pragma unroll
+            for (size_t j = 0; j < 8; j += 1) {
+                #pragma unroll
+                for (int i = 0; i < prefetch; i += 1) {
+                    inners[i] = __hfma2(reg_w[i][j], reg_a[i][j], inners[i]);
+                }
+            }
+
+            #pragma unroll
+            for (int i = 0; i < prefetch; i += 1) {
+                carries[i] = __shfl_down_sync(FULL_MASK, reg_c[i].w, 31);  // only laneId == 0 is updated
+            }
         }
 
-        if (laneId == 0) {
-            out[rowId] = delta;
+        for (size_t offset = 16; offset > 0; offset /= 2) {
+            #pragma unroll
+            for (int i = 0; i < prefetch; i += 1) {
+                inners[i] = __hadd2(inners[i], __shfl_down_sync(FULL_MASK, inners[i], offset));
+            }
+        }
+
+        if constexpr (warpsPerRow == 1) {
+            if (laneId == 0) {
+                #pragma unroll
+                for (int i = 0; i < prefetch; i += 1) {
+                    half inner = __hadd(inners[i].x, inners[i].y);
+                    out[rowId] = __hadd(out[rowId], inner);
+                }
+            }
+        } else {
+            if (laneId == 0) {
+                #pragma unroll
+                for (int i = 0; i < prefetch; i += 1) {
+                    atomicAdd(out + rowId, __hadd(inners[i].x, inners[i].y));
+                }
+            }
         }
     }
 }
@@ -266,17 +373,17 @@ __host__ static float decompress_matvec(
     torch::Tensor &x,
     torch::Tensor &out
 ) {
-    static_assert(L <= 16, "Shift register length should not exceed 16 as the kernel uses uint16_t");
+    static_assert(L <= 32, "Shift register length should not exceed 32 as the kernel uses uint32_t");
 
     CHECK_INPUT(compressed);
     TORCH_CHECK(compressed.dim() == 2);
-    TORCH_CHECK(compressed.size(1) % (4 * 32) == 0);    // each warp has 32 threads, each handling an int4
+    TORCH_CHECK(compressed.size(1) % (prefetch * warpsPerRow * 32 * 4) == 0); // 32 as in warpSize, 4 as in uint4
     TORCH_CHECK(compressed.scalar_type() == torch::kInt32);
 
     size_t compressed_m = compressed.size(0);
-    size_t compressed_n = compressed.size(1) / 4;
+    size_t compressed_n = compressed.size(1);
     size_t m = compressed_m;
-    size_t n = compressed_n * 64;   // at 2 bit, each int4 has 4x32 bits = 4x16 weights
+    size_t n = compressed_n * 16;   // at 2 bit, each uint32_t has 32 bits = 16 weights
 
     CHECK_INPUT(codebook);
     TORCH_CHECK(codebook.dim() == 1);
@@ -291,7 +398,7 @@ __host__ static float decompress_matvec(
     CHECK_INPUT(out);
     TORCH_CHECK(out.dim() == 1);
     TORCH_CHECK(out.size(0) == m);
-    TORCH_CHECK(out.scalar_type() == torch::kFloat32);
+    TORCH_CHECK(out.scalar_type() == torch::kFloat16);
 
 
     cudaDeviceProp deviceProp;
@@ -310,8 +417,8 @@ __host__ static float decompress_matvec(
     gpuErrchk(cudaEventRecord(start, stream));
 
     decompress_matvec_kernel<L><<<grid_size, block_size, 0, stream>>>(
-        (float *)out.data_ptr<float>(),
-        (const uint4 *)compressed.data_ptr<int32_t>(),
+        (half *)out.data_ptr<c10::Half>(),
+        (const uint32_t *)compressed.data_ptr<int32_t>(),
         (const half *)codebook.data_ptr<c10::Half>(),
         (const half *)x.data_ptr<c10::Half>(),
         compressed_m,
@@ -376,33 +483,33 @@ matvec_kernel(
     size_t warpId = threadId / warpSize;
     size_t warpCount = gridDim.x * blockDim.x / warpSize;
 
-    half2 w[prefetch], a[prefetch];
+    half2 reg_w[prefetchMatvec], reg_a[prefetchMatvec];
     const half2 *act = reinterpret_cast<const half2 *>(x);
 
-    for (size_t rowId = warpId / warpsPerRow;
+    for (size_t rowId = warpId / warpsPerRowMatvec;
             rowId < m;
-            rowId += warpCount / warpsPerRow) {
+            rowId += warpCount / warpsPerRowMatvec) {
         const half2 *row = reinterpret_cast<const half2 *>(decompressed + rowId * n);
         float inner = 0.0f;
 
-        for (size_t colId = (warpId % warpsPerRow) * warpSize + laneId;
+        for (size_t colId = (warpId % warpsPerRowMatvec) * warpSize + laneId;
                 colId < n / 2;
-                colId += prefetch * warpsPerRow * warpSize) {
+                colId += prefetchMatvec * warpsPerRowMatvec * warpSize) {
             #pragma unroll
-            for (size_t i = 0; i < prefetch; i += 1) {
-                w[i] = row[colId + i * warpsPerRow * warpSize];
-                a[i] = act[colId + i * warpsPerRow * warpSize];
+            for (size_t i = 0; i < prefetchMatvec; i += 1) {
+                reg_w[i] = row[colId + i * warpsPerRowMatvec * warpSize];
+                reg_a[i] = act[colId + i * warpsPerRowMatvec * warpSize];
             }
 
             #pragma unroll
-            for (size_t i = 0; i < prefetch; i += 1) {
+            for (size_t i = 0; i < prefetchMatvec; i += 1) {
                 inner = __fmaf_rn(
-                        __half2float(w[i].x),
-                        __half2float(a[i].x),
+                        __half2float(reg_w[i].x),
+                        __half2float(reg_a[i].x),
                         inner);
                 inner = __fmaf_rn(
-                        __half2float(w[i].y),
-                        __half2float(a[i].y),
+                        __half2float(reg_w[i].y),
+                        __half2float(reg_a[i].y),
                         inner);
             }
         }
@@ -425,7 +532,8 @@ __host__ extern float matvec(
 ) {
     CHECK_INPUT(decompressed);
     TORCH_CHECK(decompressed.dim() == 2);
-    TORCH_CHECK(decompressed.size(1) % (prefetch * warpsPerRow * 32 * 2) == 0); // 32 as in warpSize, 2 as in half2
+    // 32 as in warpSize, 2 as in half2
+    TORCH_CHECK(decompressed.size(1) % (prefetchMatvec * warpsPerRowMatvec * 32 * 2) == 0);
     TORCH_CHECK(decompressed.scalar_type() == torch::kFloat16);
 
     size_t m = decompressed.size(0);

@@ -14,8 +14,8 @@ def benchmark():
     x = torch.randn((n,), dtype=torch.float16, device="cuda")
 
     # warm up
-    out = torch.zeros((m,), dtype=torch.float32, device="cuda")
-    _ = rptc_kernels.matvec(decompressed, x, out)
+    throwaway = torch.empty((m,), dtype=torch.float32, device="cuda")
+    _ = rptc_kernels.matvec(decompressed, x, throwaway)
 
     out = torch.zeros((m,), dtype=torch.float32, device="cuda")
     elapsed_time = rptc_kernels.matvec(decompressed, x, out) / 1000

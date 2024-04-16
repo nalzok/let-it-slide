@@ -13,7 +13,7 @@ def benchmark():
 
     compressed = torch.randint(torch.iinfo(torch.int32).max+1, (compressed_m, compressed_n),
                       dtype=torch.int32, device="cuda")
-    codebook = torch.randn(1<<16, dtype=torch.float16, device="cuda")
+    codebook = torch.ones(1<<16, dtype=torch.float16, device="cuda")
     decompressed = torch.empty((m, n), dtype=torch.float16, device="cuda")
 
     elapsed_time = rptc_kernels.decompress(compressed, codebook, decompressed) / 1000
@@ -30,12 +30,15 @@ def benchmark():
         (8, rptc_kernels.decompress_matvec_8),
     ]
 
+    throwaway = torch.empty((m,), dtype=torch.float16, device="cuda")
     for L, decompress_matvec in matvec_list:
-        out = torch.zeros((m,), dtype=torch.float32, device="cuda")
-        _ = decompress_matvec(compressed, codebook[:1<<L], x, out)  # warm up
+        _ = decompress_matvec(compressed, codebook[:1<<L], x, throwaway)    # warm up
+        out = torch.zeros((m,), dtype=torch.float16, device="cuda")
         elapsed_time = decompress_matvec(compressed, codebook[:1<<L], x, out) / 1000
         bandwidth = memory_consumption / elapsed_time / 1024**3
         print(f"Memory Bandwidth (decompress_matvec<{L=}>): {bandwidth:.4f} GiB/s")
+        print("out", out)
+        print("torch.sum(x)", torch.sum(x))
 
 
 
