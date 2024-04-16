@@ -205,7 +205,7 @@ decompress_matvec_kernel(
     // both reg_w and reg_a are reused 4 times, hence their sizes
     uint32_t carries[prefetch];
     uint4 reg_c[prefetch];
-    half2 reg_w[prefetch][8];
+    size_t reg_w[prefetch][16];
     half2 reg_a[prefetch][8];
     half2 inners[prefetch];
 
@@ -243,10 +243,15 @@ decompress_matvec_kernel(
             #pragma unroll
             for (int i = 0; i < prefetch; i += 1) {
                 #pragma unroll
-                for (size_t j = 0; j < 8; j += 1) {
-                    reg_w[i][j] = __halves2half2(
-                            codebook_ptr[mask & __funnelshift_l(reg_c[i].x, carries[i], 4*j)],
-                            codebook_ptr[mask & __funnelshift_l(reg_c[i].x, carries[i], 4*j+2)]);
+                for (size_t j = 0; j < 16; j += 1) {
+                    reg_w[i][j] = __funnelshift_l(reg_c[i].x, carries[i], 2*j);
+                }
+            }
+            #pragma unroll
+            for (int i = 0; i < prefetch; i += 1) {
+                #pragma unroll
+                for (size_t j = 0; j < 16; j += 1) {
+                    reg_w[i][j] &= mask;
                 }
             }
             #pragma unroll
@@ -254,7 +259,10 @@ decompress_matvec_kernel(
                 #pragma unroll
                 for (int i = 0; i < prefetch; i += 1) {
                     // TODO: Kahan summation?
-                    inners[i] = __hfma2(reg_w[i][j], reg_a[i][j], inners[i]);
+                    inners[i] = __hfma2(
+                            __halves2half2(codebook_ptr[reg_w[i][2*j]], codebook_ptr[reg_w[i][2*j+1]]),
+                            reg_a[i][j],
+                            inners[i]);
                 }
             }
 
@@ -269,17 +277,25 @@ decompress_matvec_kernel(
             #pragma unroll
             for (int i = 0; i < prefetch; i += 1) {
                 #pragma unroll
-                for (size_t j = 0; j < 8; j += 1) {
-                    reg_w[i][j] = __halves2half2(
-                            codebook_ptr[mask & __funnelshift_l(reg_c[i].y, reg_c[i].x, 4*j)],
-                            codebook_ptr[mask & __funnelshift_l(reg_c[i].y, reg_c[i].x, 4*j+2)]);
+                for (size_t j = 0; j < 16; j += 1) {
+                    reg_w[i][j] = __funnelshift_l(reg_c[i].y, reg_c[i].x, 2*j);
+                }
+            }
+            #pragma unroll
+            for (int i = 0; i < prefetch; i += 1) {
+                #pragma unroll
+                for (size_t j = 0; j < 16; j += 1) {
+                    reg_w[i][j] &= mask;
                 }
             }
             #pragma unroll
             for (size_t j = 0; j < 8; j += 1) {
                 #pragma unroll
                 for (int i = 0; i < prefetch; i += 1) {
-                    inners[i] = __hfma2(reg_w[i][j], reg_a[i][j], inners[i]);
+                    inners[i] = __hfma2(
+                            __halves2half2(codebook_ptr[reg_w[i][2*j]], codebook_ptr[reg_w[i][2*j+1]]),
+                            reg_a[i][j],
+                            inners[i]);
                 }
             }
 
@@ -294,17 +310,25 @@ decompress_matvec_kernel(
             #pragma unroll
             for (int i = 0; i < prefetch; i += 1) {
                 #pragma unroll
-                for (size_t j = 0; j < 8; j += 1) {
-                    reg_w[i][j] = __halves2half2(
-                            codebook_ptr[mask & __funnelshift_l(reg_c[i].z, reg_c[i].y, 4*j)],
-                            codebook_ptr[mask & __funnelshift_l(reg_c[i].z, reg_c[i].y, 4*j+2)]);
+                for (size_t j = 0; j < 16; j += 1) {
+                    reg_w[i][j] = __funnelshift_l(reg_c[i].z, reg_c[i].y, 2*j);
+                }
+            }
+            #pragma unroll
+            for (int i = 0; i < prefetch; i += 1) {
+                #pragma unroll
+                for (size_t j = 0; j < 16; j += 1) {
+                    reg_w[i][j] &= mask;
                 }
             }
             #pragma unroll
             for (size_t j = 0; j < 8; j += 1) {
                 #pragma unroll
                 for (int i = 0; i < prefetch; i += 1) {
-                    inners[i] = __hfma2(reg_w[i][j], reg_a[i][j], inners[i]);
+                    inners[i] = __hfma2(
+                            __halves2half2(codebook_ptr[reg_w[i][2*j]], codebook_ptr[reg_w[i][2*j+1]]),
+                            reg_a[i][j],
+                            inners[i]);
                 }
             }
 
@@ -319,17 +343,25 @@ decompress_matvec_kernel(
             #pragma unroll
             for (int i = 0; i < prefetch; i += 1) {
                 #pragma unroll
-                for (size_t j = 0; j < 8; j += 1) {
-                    reg_w[i][j] = __halves2half2(
-                            codebook_ptr[mask & __funnelshift_l(reg_c[i].w, reg_c[i].z, 4*j)],
-                            codebook_ptr[mask & __funnelshift_l(reg_c[i].w, reg_c[i].z, 4*j+2)]);
+                for (size_t j = 0; j < 16; j += 1) {
+                    reg_w[i][j] = __funnelshift_l(reg_c[i].w, reg_c[i].z, 2*j);
+                }
+            }
+            #pragma unroll
+            for (int i = 0; i < prefetch; i += 1) {
+                #pragma unroll
+                for (size_t j = 0; j < 16; j += 1) {
+                    reg_w[i][j] &= mask;
                 }
             }
             #pragma unroll
             for (size_t j = 0; j < 8; j += 1) {
                 #pragma unroll
                 for (int i = 0; i < prefetch; i += 1) {
-                    inners[i] = __hfma2(reg_w[i][j], reg_a[i][j], inners[i]);
+                    inners[i] = __hfma2(
+                            __halves2half2(codebook_ptr[reg_w[i][2*j]], codebook_ptr[reg_w[i][2*j+1]]),
+                            reg_a[i][j],
+                            inners[i]);
                 }
             }
 
