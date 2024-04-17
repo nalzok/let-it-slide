@@ -207,7 +207,11 @@ decompress_matvec_kernel(
     uint4 reg_c[prefetch];
     size_t reg_w[prefetch][16];
     half2 reg_a[prefetch][8];
+#if __CUDA_ARCH__ == 610
+    float2 inners[prefetch];
+#else
     half2 inners[prefetch];
+#endif
 
     for (size_t rowId = warpId / warpsPerRow;
             rowId < compressed_m;
@@ -217,7 +221,11 @@ decompress_matvec_kernel(
         #pragma unroll
         for (size_t i = 0; i < prefetch; i += 1) {
             carries[i] = row[(compressed_n + i * warpSize - 1) % compressed_m].w;
+#if __CUDA_ARCH__ == 610
+            inners[i] = make_float2(0.0f, 0.0f);
+#else
             inners[i] = __float2half2_rn(0.0f);
+#endif
         }
 
         for (size_t colId = threadId % stride;
@@ -259,10 +267,19 @@ decompress_matvec_kernel(
                 #pragma unroll
                 for (int i = 0; i < prefetch; i += 1) {
                     // TODO: Kahan summation?
+#if __CUDA_ARCH__ == 610
+                    inners[i].x = __fmaf_rn(__half2float(codebook_ptr[reg_w[i][2*j]]),
+                            __half2float(reg_a[i][j].x),
+                            inners[i].x);
+                    inners[i].y = __fmaf_rn(__half2float(codebook_ptr[reg_w[i][2*j+1]]),
+                            __half2float(reg_a[i][j].y),
+                            inners[i].y);
+#else
                     inners[i] = __hfma2(
                             __halves2half2(codebook_ptr[reg_w[i][2*j]], codebook_ptr[reg_w[i][2*j+1]]),
                             reg_a[i][j],
                             inners[i]);
+#endif
                 }
             }
 
@@ -292,10 +309,19 @@ decompress_matvec_kernel(
             for (size_t j = 0; j < 8; j += 1) {
                 #pragma unroll
                 for (int i = 0; i < prefetch; i += 1) {
+#if __CUDA_ARCH__ == 610
+                    inners[i].x = __fmaf_rn(__half2float(codebook_ptr[reg_w[i][2*j]]),
+                            __half2float(reg_a[i][j].x),
+                            inners[i].x);
+                    inners[i].y = __fmaf_rn(__half2float(codebook_ptr[reg_w[i][2*j+1]]),
+                            __half2float(reg_a[i][j].y),
+                            inners[i].y);
+#else
                     inners[i] = __hfma2(
                             __halves2half2(codebook_ptr[reg_w[i][2*j]], codebook_ptr[reg_w[i][2*j+1]]),
                             reg_a[i][j],
                             inners[i]);
+#endif
                 }
             }
 
@@ -325,10 +351,19 @@ decompress_matvec_kernel(
             for (size_t j = 0; j < 8; j += 1) {
                 #pragma unroll
                 for (int i = 0; i < prefetch; i += 1) {
+#if __CUDA_ARCH__ == 610
+                    inners[i].x = __fmaf_rn(__half2float(codebook_ptr[reg_w[i][2*j]]),
+                            __half2float(reg_a[i][j].x),
+                            inners[i].x);
+                    inners[i].y = __fmaf_rn(__half2float(codebook_ptr[reg_w[i][2*j+1]]),
+                            __half2float(reg_a[i][j].y),
+                            inners[i].y);
+#else
                     inners[i] = __hfma2(
                             __halves2half2(codebook_ptr[reg_w[i][2*j]], codebook_ptr[reg_w[i][2*j+1]]),
                             reg_a[i][j],
                             inners[i]);
+#endif
                 }
             }
 
@@ -358,10 +393,19 @@ decompress_matvec_kernel(
             for (size_t j = 0; j < 8; j += 1) {
                 #pragma unroll
                 for (int i = 0; i < prefetch; i += 1) {
+#if __CUDA_ARCH__ == 610
+                    inners[i].x = __fmaf_rn(__half2float(codebook_ptr[reg_w[i][2*j]]),
+                            __half2float(reg_a[i][j].x),
+                            inners[i].x);
+                    inners[i].y = __fmaf_rn(__half2float(codebook_ptr[reg_w[i][2*j+1]]),
+                            __half2float(reg_a[i][j].y),
+                            inners[i].y);
+#else
                     inners[i] = __hfma2(
                             __halves2half2(codebook_ptr[reg_w[i][2*j]], codebook_ptr[reg_w[i][2*j+1]]),
                             reg_a[i][j],
                             inners[i]);
+#endif
                 }
             }
 
@@ -374,23 +418,33 @@ decompress_matvec_kernel(
         for (size_t offset = 16; offset > 0; offset /= 2) {
             #pragma unroll
             for (int i = 0; i < prefetch; i += 1) {
+#if __CUDA_ARCH__ == 610
+                inners[i].x += __shfl_down_sync(FULL_MASK, inners[i].x, offset);
+                inners[i].y += __shfl_down_sync(FULL_MASK, inners[i].y, offset);
+#else
                 inners[i] = __hadd2(inners[i], __shfl_down_sync(FULL_MASK, inners[i], offset));
+#endif
             }
         }
 
-        if constexpr (warpsPerRow == 1) {
-            if (laneId == 0) {
+        if (laneId == 0) {
+            if constexpr (warpsPerRow == 1) {
                 #pragma unroll
                 for (int i = 0; i < prefetch; i += 1) {
-                    half inner = __hadd(inners[i].x, inners[i].y);
-                    out[rowId] = __hadd(out[rowId], inner);
+#if __CUDA_ARCH__ == 610
+                    out[rowId] = __float2half(inners[i].x + inners[i].y);
+#else
+                    out[rowId] = __hadd(inners[i].x, inners[i].y);
+#endif
                 }
-            }
-        } else {
-            if (laneId == 0) {
+            } else {
                 #pragma unroll
                 for (int i = 0; i < prefetch; i += 1) {
+#if __CUDA_ARCH__ == 610
+                    static_assert(warpsPerRow == 1, "atomicAdd(half *, half) is not supported");
+#else
                     atomicAdd(out + rowId, __hadd(inners[i].x, inners[i].y));
+#endif
                 }
             }
         }
