@@ -432,9 +432,10 @@ decompress_matvec_kernel(
                 #pragma unroll
                 for (int i = 0; i < prefetch; i += 1) {
 #if __CUDA_ARCH__ == 610
-                    out[rowId] = __float2half(inners[i].x + inners[i].y);
+                    out[rowId] = __float2half(__half2float(out[rowId]) + inners[i].x + inners[i].y);
 #else
-                    out[rowId] = __hadd(inners[i].x, inners[i].y);
+                    half inner = __hadd(inners[i].x, inners[i].y);
+                    out[rowId] = __hadd(out[rowId], inner);
 #endif
                 }
             } else {
