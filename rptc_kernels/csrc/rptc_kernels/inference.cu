@@ -29,8 +29,10 @@ using namespace nvcuda;
 
 constexpr size_t warpsPerRow = 1;
 constexpr size_t prefetch = 2;
-constexpr size_t warpsPerRowMatvec = 4;
-constexpr size_t prefetchMatvec = 16;
+constexpr size_t warpsPerRowMatvec = 2;
+constexpr size_t prefetchMatvec = 32;
+constexpr size_t warpsPerRowRowsum = 2;
+constexpr size_t prefetchRowsum = 32;
 
 #define FULL_MASK 0xFFFFFFFFU
 #define HALF_MASK 0x0000FFFFU
@@ -185,13 +187,13 @@ decompress_matvec_kernel(
 ) {
     const half *__restrict__ codebook_ptr = codebook;
 
-    // if constexpr (L < 16) {
-    //     __shared__ half smem[1<<L];
-    //     for (int cb_idx = threadIdx.x; cb_idx < (1<<L)/8; cb_idx += blockDim.x) {
-    //         reinterpret_cast<uint4 *>(smem)[cb_idx] = reinterpret_cast<const uint4 *>(codebook)[cb_idx];
-    //     }
-    //     codebook_ptr = smem;
-    // }
+    if constexpr (L < 16) {
+        __shared__ half smem[1<<L];
+        for (int cb_idx = threadIdx.x; cb_idx < (1<<L)/8; cb_idx += blockDim.x) {
+            reinterpret_cast<uint4 *>(smem)[cb_idx] = reinterpret_cast<const uint4 *>(codebook)[cb_idx];
+        }
+        codebook_ptr = smem;
+    }
 
     constexpr uint16_t mask = (1<<L) - 1;
 
@@ -559,7 +561,7 @@ __host__ extern float decompress_matvec_8(
 __global__ static void
 __launch_bounds__(MAX_THREADS_PER_BLOCK, MIN_BLOCKS_PER_MP)
 matvec_kernel(
-    float *__restrict__ out,
+    half *__restrict__ out,
     const half *__restrict__ decompressed,
     const half *__restrict__ x,
     size_t m,
@@ -569,6 +571,7 @@ matvec_kernel(
     size_t laneId = threadIdx.x % warpSize;
     size_t warpId = threadId / warpSize;
     size_t warpCount = gridDim.x * blockDim.x / warpSize;
+    size_t stride = warpsPerRowMatvec * warpSize;
 
     half2 reg_w[prefetchMatvec], reg_a[prefetchMatvec];
     const half2 *act = reinterpret_cast<const half2 *>(x);
@@ -577,36 +580,29 @@ matvec_kernel(
             rowId < m;
             rowId += warpCount / warpsPerRowMatvec) {
         const half2 *row = reinterpret_cast<const half2 *>(decompressed + rowId * n);
-        float inner = 0.0f;
+        half2 inner = __float2half2_rn(0.0f);
 
-        for (size_t colId = (warpId % warpsPerRowMatvec) * warpSize + laneId;
+        for (size_t colId = threadId % stride;
                 colId < n / 2;
-                colId += prefetchMatvec * warpsPerRowMatvec * warpSize) {
+                colId += prefetchMatvec * stride) {
             #pragma unroll
-            for (size_t i = 0; i < prefetchMatvec; i += 1) {
-                reg_w[i] = row[colId + i * warpsPerRowMatvec * warpSize];
-                reg_a[i] = act[colId + i * warpsPerRowMatvec * warpSize];
+            for (size_t j = 0; j < prefetchMatvec; j += 1) {
+                reg_w[j] = row[colId + j * stride];
+                reg_a[j] = act[colId + j * stride];
             }
 
             #pragma unroll
-            for (size_t i = 0; i < prefetchMatvec; i += 1) {
-                inner = __fmaf_rn(
-                        __half2float(reg_w[i].x),
-                        __half2float(reg_a[i].x),
-                        inner);
-                inner = __fmaf_rn(
-                        __half2float(reg_w[i].y),
-                        __half2float(reg_a[i].y),
-                        inner);
+            for (size_t j = 0; j < prefetchMatvec; j += 1) {
+                inner = __hfma2(reg_w[j], reg_a[j], inner);
             }
         }
 
         for (size_t offset = 16; offset > 0; offset /= 2) {
-            inner += __shfl_down_sync(FULL_MASK, inner, offset);
+            inner = __hadd2(inner, __shfl_down_sync(FULL_MASK, inner, offset));
         }
 
         if (laneId == 0) {
-            atomicAdd(out + rowId, inner);
+            atomicAdd(out + rowId, __hadd(inner.x, inner.y));
         }
     }
 }
@@ -634,7 +630,7 @@ __host__ extern float matvec(
     CHECK_INPUT(out);
     TORCH_CHECK(out.dim() == 1);
     TORCH_CHECK(out.size(0) == m);
-    TORCH_CHECK(out.scalar_type() == torch::kFloat32);
+    TORCH_CHECK(out.scalar_type() == torch::kFloat16);
 
 
     cudaDeviceProp deviceProp;
@@ -653,9 +649,111 @@ __host__ extern float matvec(
     gpuErrchk(cudaEventRecord(start, stream));
 
     matvec_kernel<<<grid_size, block_size, 0, stream>>>(
-        (float *)out.data_ptr<float>(),
+        (half *)out.data_ptr<c10::Half>(),
         (const half *)decompressed.data_ptr<c10::Half>(),
         (const half *)x.data_ptr<c10::Half>(),
+        m,
+        n);
+
+    gpuErrchk(cudaPeekAtLastError());
+
+    gpuErrchk(cudaEventRecord(stop, stream));
+    gpuErrchk(cudaEventSynchronize(stop));
+
+    float msecTotal = 0.0f;
+    gpuErrchk(cudaEventElapsedTime(&msecTotal, start, stop));
+
+    gpuErrchk(cudaEventDestroy(start));
+    gpuErrchk(cudaEventDestroy(stop));
+
+    return msecTotal;
+}
+
+
+__global__ static void
+__launch_bounds__(MAX_THREADS_PER_BLOCK, MIN_BLOCKS_PER_MP)
+rowsum_kernel(
+    half *__restrict__ out,
+    const half *__restrict__ decompressed,
+    size_t m,
+    size_t n
+) {
+    size_t threadId = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t laneId = threadIdx.x % warpSize;
+    size_t warpId = threadId / warpSize;
+    size_t warpCount = gridDim.x * blockDim.x / warpSize;
+    size_t stride = warpsPerRowRowsum * warpSize;
+
+    half2 reg_w[prefetchRowsum];
+
+    for (size_t rowId = warpId / warpsPerRowRowsum;
+            rowId < m;
+            rowId += warpCount / warpsPerRowRowsum) {
+        const half2 *row = reinterpret_cast<const half2 *>(decompressed + rowId * n);
+        half2 inner = __float2half2_rn(0.0f);
+
+        for (size_t colId = threadId % stride;
+                colId < n / 2;
+                colId += prefetchRowsum * stride) {
+            #pragma unroll
+            for (size_t j = 0; j < prefetchRowsum; j += 1) {
+                reg_w[j] = row[colId + j * stride];
+            }
+
+            #pragma unroll
+            for (size_t j = 0; j < prefetchRowsum; j += 1) {
+                inner = __hadd2(inner, reg_w[j]);
+            }
+        }
+
+        for (size_t offset = 16; offset > 0; offset /= 2) {
+            inner = __hadd2(inner, __shfl_down_sync(FULL_MASK, inner, offset));
+        }
+
+        if (laneId == 0) {
+            atomicAdd(out + rowId, __hadd(inner.x, inner.y));
+        }
+    }
+}
+
+
+__host__ extern float rowsum(
+    torch::Tensor &decompressed,
+    torch::Tensor &out
+) {
+    CHECK_INPUT(decompressed);
+    TORCH_CHECK(decompressed.dim() == 2);
+    // 32 as in warpSize, 2 as in half2
+    TORCH_CHECK(decompressed.size(1) % (prefetchRowsum * warpsPerRowRowsum * 32 * 2) == 0);
+    TORCH_CHECK(decompressed.scalar_type() == torch::kFloat16);
+
+    size_t m = decompressed.size(0);
+    size_t n = decompressed.size(1);
+
+    CHECK_INPUT(out);
+    TORCH_CHECK(out.dim() == 1);
+    TORCH_CHECK(out.size(0) == m);
+    TORCH_CHECK(out.scalar_type() == torch::kFloat16);
+
+
+    cudaDeviceProp deviceProp;
+    cudaGetDeviceProperties(&deviceProp, decompressed.get_device());
+    size_t grid_size = MIN_BLOCKS_PER_MP * static_cast<size_t>(deviceProp.multiProcessorCount);
+    size_t block_size = MAX_THREADS_PER_BLOCK;
+
+    cudaStream_t stream;
+    gpuErrchk(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+
+    cudaEvent_t start, stop;
+    gpuErrchk(cudaEventCreate(&start));
+    gpuErrchk(cudaEventCreate(&stop));
+
+    gpuErrchk(cudaStreamSynchronize(stream));
+    gpuErrchk(cudaEventRecord(start, stream));
+
+    rowsum_kernel<<<grid_size, block_size, 0, stream>>>(
+        (half *)out.data_ptr<c10::Half>(),
+        (const half *)decompressed.data_ptr<c10::Half>(),
         m,
         n);
 
