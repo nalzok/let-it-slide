@@ -27,13 +27,6 @@ using namespace nvcuda;
 #define MAX_THREADS_PER_BLOCK 1024
 #define MIN_BLOCKS_PER_MP 2
 
-constexpr size_t warpsPerRow = 1;
-constexpr size_t prefetch = 2;
-constexpr size_t warpsPerRowMatvec = 2;
-constexpr size_t prefetchMatvec = 32;
-constexpr size_t warpsPerRowRowsum = 2;
-constexpr size_t prefetchRowsum = 32;
-
 #define FULL_MASK 0xFFFFFFFFU
 #define HALF_MASK 0x0000FFFFU
 
@@ -41,6 +34,23 @@ constexpr size_t prefetchRowsum = 32;
 #define CHECK_CONTIGUOUS(x)     TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_INPUT(x) 	        do { CHECK_CUDA(x); CHECK_CONTIGUOUS(x); } while(false)
 #define gpuErrchk(ans)          do { gpuAssert((ans), __FILE__, __LINE__); } while (false)
+
+
+#if __CUDA_ARCH__ == 610
+constexpr size_t warpsPerRow = 1;
+constexpr size_t prefetch = 1;
+constexpr size_t warpsPerRowMatvec = 1;
+constexpr size_t prefetchMatvec = 8;
+constexpr size_t warpsPerRowRowsum = 1;
+constexpr size_t prefetchRowsum = 8;
+#else
+constexpr size_t warpsPerRow = 1;
+constexpr size_t prefetch = 2;
+constexpr size_t warpsPerRowMatvec = 2;
+constexpr size_t prefetchMatvec = 32;
+constexpr size_t warpsPerRowRowsum = 2;
+constexpr size_t prefetchRowsum = 32;
+#endif
 
 
 __host__ static inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
@@ -436,8 +446,8 @@ decompress_matvec_kernel(
 #if __CUDA_ARCH__ == 610
                     out[rowId] = __float2half(__half2float(out[rowId]) + inners[i].x + inners[i].y);
 #else
-                    half inner = __hadd(inners[i].x, inners[i].y);
-                    out[rowId] = __hadd(out[rowId], inner);
+                    half delta = __hadd(inners[i].x, inners[i].y);
+                    out[rowId] = __hadd(out[rowId], delta);
 #endif
                 }
             } else {
@@ -580,7 +590,11 @@ matvec_kernel(
             rowId < m;
             rowId += warpCount / warpsPerRowMatvec) {
         const half2 *row = reinterpret_cast<const half2 *>(decompressed + rowId * n);
+#if __CUDA_ARCH__ == 610
+        float2 inner = make_float2(0.0f, 0.0f);
+#else
         half2 inner = __float2half2_rn(0.0f);
+#endif
 
         for (size_t colId = threadId % stride;
                 colId < n / 2;
@@ -593,16 +607,43 @@ matvec_kernel(
 
             #pragma unroll
             for (size_t j = 0; j < prefetchMatvec; j += 1) {
+#if __CUDA_ARCH__ == 610
+                inner.x = __fmaf_rn(__half2float(reg_w[j].x),
+                        __half2float(reg_a[j].x),
+                        inner.x);
+                inner.y = __fmaf_rn(__half2float(reg_w[j].y),
+                        __half2float(reg_a[j].y),
+                        inner.y);
+#else
                 inner = __hfma2(reg_w[j], reg_a[j], inner);
+#endif
             }
         }
 
         for (size_t offset = 16; offset > 0; offset /= 2) {
+#if __CUDA_ARCH__ == 610
+            inner.x += __shfl_down_sync(FULL_MASK, inner.x, offset);
+            inner.y += __shfl_down_sync(FULL_MASK, inner.y, offset);
+#else
             inner = __hadd2(inner, __shfl_down_sync(FULL_MASK, inner, offset));
+#endif
         }
 
         if (laneId == 0) {
-            atomicAdd(out + rowId, __hadd(inner.x, inner.y));
+            if constexpr (warpsPerRowMatvec == 1) {
+#if __CUDA_ARCH__ == 610
+                out[rowId] = __float2half(__half2float(out[rowId]) + inner.x + inner.y);
+#else
+                half delta = __hadd(inner.x, inner.y);
+                out[rowId] = __hadd(out[rowId], delta);
+#endif
+            } else {
+#if __CUDA_ARCH__ == 610
+                static_assert(warpsPerRowMatvec == 1, "atomicAdd(half *, half) is not supported");
+#else
+                atomicAdd(out + rowId, __hadd(inner.x, inner.y));
+#endif
+            }
         }
     }
 }
@@ -690,7 +731,11 @@ rowsum_kernel(
             rowId < m;
             rowId += warpCount / warpsPerRowRowsum) {
         const half2 *row = reinterpret_cast<const half2 *>(decompressed + rowId * n);
+#if __CUDA_ARCH__ == 610
+        float2 inner = make_float2(0.0f, 0.0f);
+#else
         half2 inner = __float2half2_rn(0.0f);
+#endif
 
         for (size_t colId = threadId % stride;
                 colId < n / 2;
@@ -702,16 +747,39 @@ rowsum_kernel(
 
             #pragma unroll
             for (size_t j = 0; j < prefetchRowsum; j += 1) {
+#if __CUDA_ARCH__ == 610
+                inner.x += __half2float(reg_w[j].x);
+                inner.y += __half2float(reg_w[j].y);
+#else
                 inner = __hadd2(inner, reg_w[j]);
+#endif
             }
         }
 
         for (size_t offset = 16; offset > 0; offset /= 2) {
+#if __CUDA_ARCH__ == 610
+            inner.x += __shfl_down_sync(FULL_MASK, inner.x, offset);
+            inner.y += __shfl_down_sync(FULL_MASK, inner.y, offset);
+#else
             inner = __hadd2(inner, __shfl_down_sync(FULL_MASK, inner, offset));
+#endif
         }
 
         if (laneId == 0) {
-            atomicAdd(out + rowId, __hadd(inner.x, inner.y));
+            if constexpr (warpsPerRowRowsum == 1) {
+#if __CUDA_ARCH__ == 610
+                out[rowId] = __float2half(__half2float(out[rowId]) + inner.x + inner.y);
+#else
+                half delta = __hadd(inner.x, inner.y);
+                out[rowId] = __hadd(out[rowId], delta);
+#endif
+            } else {
+#if __CUDA_ARCH__ == 610
+                static_assert(warpsPerRowRowsum == 1, "atomicAdd(half *, half) is not supported");
+#else
+                atomicAdd(out + rowId, __hadd(inner.x, inner.y));
+#endif
+            }
         }
     }
 }
