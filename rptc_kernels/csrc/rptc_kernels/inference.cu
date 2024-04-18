@@ -40,7 +40,7 @@ using namespace nvcuda;
 constexpr size_t warpsPerRow = 1;
 constexpr size_t prefetch = 1;
 constexpr size_t warpsPerRowMatvec = 1;
-constexpr size_t prefetchMatvec = 8;
+constexpr size_t prefetchMatvec = 4;
 constexpr size_t warpsPerRowRowsum = 1;
 constexpr size_t prefetchRowsum = 8;
 #else
