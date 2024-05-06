@@ -7,12 +7,13 @@ setup(
         CUDAExtension(
             name="rptc_kernels",
             sources=["csrc/rptc_kernels/wrapper.cpp",
-                     "csrc/rptc_kernels/inference.cu"],
+                     "csrc/rptc_kernels/inference.cu",
+                     "csrc/rptc_kernels/inference_t.cu"],
             extra_compile_args={
-                # "cxx": ["-O2", "-g", "-lineinfo", "-std=c++17"],
-                # "nvcc": ["-O2", "-g", "-G", "-std=c++17", "--ptxas-options=-v", "-Xcompiler", "-rdynamic"],
-                "cxx": ["-O3", "-lineinfo", "-std=c++17"],
-                "nvcc": ["-O3", "-lineinfo", "-std=c++17", "--ptxas-options=-v"],
+                # "cxx": ["-O2", "--fast-math", "-g", "-lineinfo", "-std=c++17"],
+                # "nvcc": ["-O2", "--use_fast_math", "-g", "-G", "-keep", "-std=c++17", "--ptxas-options=-v", "-Xcompiler", "-rdynamic"],
+                "cxx": ["-O3", "--fast-math", "-lineinfo", "-std=c++17"],
+                "nvcc": ["-O3", "--use_fast_math", "-lineinfo", "-keep", "-std=c++17", "--ptxas-options=-v"],
             }
         )
     ],

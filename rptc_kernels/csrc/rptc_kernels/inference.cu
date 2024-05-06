@@ -24,8 +24,7 @@
 using namespace torch::indexing;
 using namespace nvcuda;
 
-#define MAX_THREADS_PER_BLOCK 1024
-#define MIN_BLOCKS_PER_MP 2
+#define MAX_THREADS_PER_BLOCK 256
 
 #define FULL_MASK 0xFFFFFFFFU
 #define HALF_MASK 0x0000FFFFU
@@ -34,23 +33,6 @@ using namespace nvcuda;
 #define CHECK_CONTIGUOUS(x)     TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_INPUT(x) 	        do { CHECK_CUDA(x); CHECK_CONTIGUOUS(x); } while(false)
 #define gpuErrchk(ans)          do { gpuAssert((ans), __FILE__, __LINE__); } while (false)
-
-
-#if __CUDA_ARCH__ == 610
-constexpr size_t warpsPerRow = 1;
-constexpr size_t prefetch = 1;
-constexpr size_t warpsPerRowMatvec = 1;
-constexpr size_t prefetchMatvec = 4;
-constexpr size_t warpsPerRowRowsum = 1;
-constexpr size_t prefetchRowsum = 8;
-#else
-constexpr size_t warpsPerRow = 1;
-constexpr size_t prefetch = 2;
-constexpr size_t warpsPerRowMatvec = 2;
-constexpr size_t prefetchMatvec = 32;
-constexpr size_t warpsPerRowRowsum = 2;
-constexpr size_t prefetchRowsum = 32;
-#endif
 
 
 __host__ static inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
@@ -62,9 +44,14 @@ __host__ static inline void gpuAssert(cudaError_t code, const char *file, int li
     }
 }
 
+typedef union __align__(4) alias_half_uint16 {
+    half2 foo;
+    uint16_t bar[2];
+} alias_half_uint16;
+
 
 __global__ static void
-__launch_bounds__(MAX_THREADS_PER_BLOCK, MIN_BLOCKS_PER_MP)
+__launch_bounds__(MAX_THREADS_PER_BLOCK)
 decompress_kernel(
     half *__restrict__ out,
     const uint4 *__restrict__ compressed,
@@ -149,7 +136,7 @@ __host__ extern float decompress(
 
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, compressed.get_device());
-    size_t grid_size = MIN_BLOCKS_PER_MP * static_cast<size_t>(deviceProp.multiProcessorCount);
+    size_t grid_size = 2 * static_cast<size_t>(deviceProp.multiProcessorCount);
     size_t block_size = MAX_THREADS_PER_BLOCK;
 
     cudaStream_t stream;
@@ -186,281 +173,145 @@ __host__ extern float decompress(
 
 template <size_t L>
 __global__ static void
-__launch_bounds__(MAX_THREADS_PER_BLOCK, MIN_BLOCKS_PER_MP)
+__launch_bounds__(MAX_THREADS_PER_BLOCK)
 decompress_matvec_kernel(
     half *__restrict__ out,
-    const uint32_t *__restrict__ compressed,
+    const uint4 *__restrict__ compressed,
     const half *__restrict__ codebook,
-    const half *__restrict__ x,
-    size_t compressed_m,
-    size_t compressed_n
+    const half2 *__restrict__ x,
+    size_t iters_per_thread,
+    size_t m,
+    size_t n
 ) {
     const half *__restrict__ codebook_ptr = codebook;
-
     if constexpr (L < 16) {
-        __shared__ half smem[1<<L];
-        for (int cb_idx = threadIdx.x; cb_idx < (1<<L)/8; cb_idx += blockDim.x) {
-            reinterpret_cast<uint4 *>(smem)[cb_idx] = reinterpret_cast<const uint4 *>(codebook)[cb_idx];
+        __shared__ half smem_codebook[1<<L];
+        size_t offset_quarter = 1<<(L-2);
+        // uint32_t *smem_x = reinterpret_cast<uint32_t *>(smem_codebook);
+        // uint32_t *smem_y = reinterpret_cast<uint32_t *>(smem_codebook + offset_quarter);
+        // uint32_t *smem_w = reinterpret_cast<uint32_t *>(smem_codebook + offset_quarter * 2);
+        // uint32_t *smem_z = reinterpret_cast<uint32_t *>(smem_codebook + offset_quarter * 3);
+
+        for (size_t idx = threadIdx.x; idx < (1<<L)/8; idx += blockDim.x) {
+            // read in uint4 from global memory, and then write in uint32_t into shared memory
+            uint4 quadruple = reinterpret_cast<const uint4 *>(codebook)[idx];
+            reinterpret_cast<uint4 *>(smem_codebook)[idx] = quadruple;
+            // asm("prefetchu.L1 [%0];" : : "l" (codebook + idx * 8));
+            // asm("prefetchu.L1 [%0];" : : "l" (codebook + idx * 8 + 1));
+            // asm("prefetchu.L1 [%0];" : : "l" (codebook + idx * 8 + 2));
+            // asm("prefetchu.L1 [%0];" : : "l" (codebook + idx * 8 + 3));
+            // asm("prefetchu.L1 [%0];" : : "l" (codebook + idx * 8 + 4));
+            // asm("prefetchu.L1 [%0];" : : "l" (codebook + idx * 8 + 5));
+            // asm("prefetchu.L1 [%0];" : : "l" (codebook + idx * 8 + 6));
+            // asm("prefetchu.L1 [%0];" : : "l" (codebook + idx * 8 + 7));
+            // uintptr_t ptr = reinterpret_cast<uintptr_t>(&codebook[idx]);
+            // if (ptr % 128 == 0) {
+            //     asm("prefetch.local.L1 [%0];" : : "l" (ptr));
+            // }
+            // asm("prefetch.global.L1 [%0];" : : "l" (codebook + idx * 8));
+            // asm("prefetch.global.L1 [%0];" : : "l" (codebook + idx * 8 + 1));
+            // asm("prefetch.global.L1 [%0];" : : "l" (codebook + idx * 8 + 2));
+            // asm("prefetch.global.L1 [%0];" : : "l" (codebook + idx * 8 + 3));
+            // asm("prefetch.global.L1 [%0];" : : "l" (codebook + idx * 8 + 4));
+            // asm("prefetch.global.L1 [%0];" : : "l" (codebook + idx * 8 + 5));
+            // asm("prefetch.global.L1 [%0];" : : "l" (codebook + idx * 8 + 6));
+            // asm("prefetch.global.L1 [%0];" : : "l" (codebook + idx * 8 + 7));
+            // smem_x[idx] = quadruple.x;
+            // smem_y[idx] = quadruple.y;
+            // smem_z[idx] = quadruple.z;
+            // smem_w[idx] = quadruple.w;
         }
-        codebook_ptr = smem;
+        codebook_ptr = smem_codebook;
     }
 
+    __syncthreads();
+
     constexpr uint16_t mask = (1<<L) - 1;
+    constexpr uint16_t lane_mask = mask & ~0b111110;
 
     size_t threadId = blockIdx.x * blockDim.x + threadIdx.x;
     size_t laneId = threadIdx.x % warpSize;
     size_t warpId = threadId / warpSize;
-    size_t warpCount = gridDim.x * blockDim.x / warpSize;
-    size_t stride = warpsPerRow * warpSize;
+    size_t strideC = blockDim.x * gridDim.x;
+    size_t strideX = warpSize * 4;
 
-    // each int4 has 4x32 bits, which corresponds to 4x16 weights at 2 bit
-    // both reg_w and reg_a are reused 4 times, hence their sizes
-    uint32_t carries[prefetch];
-    uint4 reg_c[prefetch];
-    size_t reg_w[prefetch][16];
-    half2 reg_a[prefetch][8];
-#if __CUDA_ARCH__ == 610
-    float2 inners[prefetch];
-#else
-    half2 inners[prefetch];
-#endif
+    uint32_t carry = 0U;
+    half2 inners[4] = {
+        __float2half2_rn(0.0f),
+        __float2half2_rn(0.0f),
+        __float2half2_rn(0.0f),
+        __float2half2_rn(0.0f),
+    };
 
-    for (size_t rowId = warpId / warpsPerRow;
-            rowId < compressed_m;
-            rowId += warpCount / warpsPerRow) {
-        const uint4 *row = reinterpret_cast<const uint4 *>(compressed + rowId * compressed_n);
+    for (size_t iter = 0; iter < iters_per_thread; iter += 1) {
+        // uint4 elem = compressed[iter * strideC + threadId];
+
+        uint4 elem;
+        asm volatile ("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(elem.x), "=r"(elem.y), "=r"(elem.z), "=r"(elem.w)
+                : "l" (compressed + iter * strideC + threadId));
+        // ld.global.nc.v4.u32     {%r427, %r428, %r429, %r430}, [%rd323];
+
+        // send w in lane X to carry in lane X+1, lane 0 not updated
+        carry = __shfl_up_sync(FULL_MASK, elem.w, 1);
+
+        // send w in lane 31 to carry in lane 0, lane 1-31 not updated
+        uint32_t next_carry = __shfl_down_sync(FULL_MASK, elem.w, 31);
+
+        uint32_t reg_c[5] = { carry, elem.x, elem.y, elem.z, elem.w };
+
+        alias_half_uint16 reg_w[4][8];
+        half2 reg_a[4][8];
+        #pragma unroll
+        for (size_t k = 0; k < 4; k += 1) {
+            #pragma unroll
+            for (size_t j = 0; j < 8; j += 1) {
+                // TODO: would uint16_t be faster?
+                uint32_t state_x = (lane_mask & __funnelshift_l(reg_c[k+1], reg_c[k], 4*j)) | (laneId << 1);
+                uint32_t state_y = (lane_mask & __funnelshift_l(reg_c[k+1], reg_c[k], 4*j+2)) | (laneId << 1);
+
+                // state_x = state_x * (2*state_x+1);
+                // state_x = state_x * 1664525 + 1013904223;
+                // state_y = state_y * (2*state_y+1);
+                // state_y = state_y * 1664525 + 1013904223;
+
+                // reg_w[k][j].foo = __halves2half2(codebook_ptr[idx_x], codebook_ptr[idx_y]);
+                // TODO: Section 3.2 in https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=10318209
+                // reg_w[k][j].foo = h2cos(__halves2half2(
+                //     __float2half(sinf(__uint_as_float(idx_x))),
+                //     __float2half(fabsf(__uint_as_float(idx_y)))
+                // ));
+                asm volatile ("ld.global.nc.b16 %0, [%1];"
+                        : "=h"(reg_w[k][j].bar[0])
+                        : "l" (codebook_ptr + state_x));
+                asm volatile ("ld.global.nc.b16 %0, [%1];"
+                        : "=h"(reg_w[k][j].bar[1])
+                        : "l" (codebook_ptr + state_y));
+                reg_a[k][j] = x[((iter * 4 + k) * 8 + j) * warpSize + laneId];
+            }
+        }
 
         #pragma unroll
-        for (size_t i = 0; i < prefetch; i += 1) {
-            carries[i] = row[(compressed_n + i * warpSize - 1) % compressed_m].w;
-#if __CUDA_ARCH__ == 610
-            inners[i] = make_float2(0.0f, 0.0f);
-#else
-            inners[i] = __float2half2_rn(0.0f);
-#endif
-        }
-
-        for (size_t colId = threadId % stride;
-                colId < compressed_n / 4;
-                colId += prefetch * stride) {
+        for (size_t j = 0; j < 8; j += 1) {
             #pragma unroll
-            for (size_t i = 0; i < prefetch; i += 1) {
-                reg_c[i] = row[colId + i * stride];
-            }
-
-            const half2 *act = reinterpret_cast<const half2 *>(x) + threadId % stride;
-            #pragma unroll
-            for (size_t i = 0; i < prefetch; i += 1) {
-                #pragma unroll
-                for (size_t j = 0; j < 8; j += 1) {
-                    reg_a[i][j] = act[(i*8+j)*stride];
-                }
-            }
-            #pragma unroll
-            for (size_t i = 0; i < prefetch; i += 1) {
-                carries[i] = __shfl_up_sync(FULL_MASK, reg_c[i].w, 1);  // laneId == 0 is not updated
-            }
-            #pragma unroll
-            for (int i = 0; i < prefetch; i += 1) {
-                #pragma unroll
-                for (size_t j = 0; j < 16; j += 1) {
-                    reg_w[i][j] = __funnelshift_l(reg_c[i].x, carries[i], 2*j);
-                }
-            }
-            #pragma unroll
-            for (int i = 0; i < prefetch; i += 1) {
-                #pragma unroll
-                for (size_t j = 0; j < 16; j += 1) {
-                    reg_w[i][j] &= mask;
-                }
-            }
-            #pragma unroll
-            for (size_t j = 0; j < 8; j += 1) {
-                #pragma unroll
-                for (int i = 0; i < prefetch; i += 1) {
-                    // TODO: Kahan summation?
-#if __CUDA_ARCH__ == 610
-                    inners[i].x = __fmaf_rn(__half2float(codebook_ptr[reg_w[i][2*j]]),
-                            __half2float(reg_a[i][j].x),
-                            inners[i].x);
-                    inners[i].y = __fmaf_rn(__half2float(codebook_ptr[reg_w[i][2*j+1]]),
-                            __half2float(reg_a[i][j].y),
-                            inners[i].y);
-#else
-                    inners[i] = __hfma2(
-                            __halves2half2(codebook_ptr[reg_w[i][2*j]], codebook_ptr[reg_w[i][2*j+1]]),
-                            reg_a[i][j],
-                            inners[i]);
-#endif
-                }
-            }
-
-            act += prefetch * 8 * stride;
-            #pragma unroll
-            for (size_t i = 0; i < prefetch; i += 1) {
-                #pragma unroll
-                for (size_t j = 0; j < 8; j += 1) {
-                    reg_a[i][j] = act[(i*8+j)*stride];
-                }
-            }
-            #pragma unroll
-            for (int i = 0; i < prefetch; i += 1) {
-                #pragma unroll
-                for (size_t j = 0; j < 16; j += 1) {
-                    reg_w[i][j] = __funnelshift_l(reg_c[i].y, reg_c[i].x, 2*j);
-                }
-            }
-            #pragma unroll
-            for (int i = 0; i < prefetch; i += 1) {
-                #pragma unroll
-                for (size_t j = 0; j < 16; j += 1) {
-                    reg_w[i][j] &= mask;
-                }
-            }
-            #pragma unroll
-            for (size_t j = 0; j < 8; j += 1) {
-                #pragma unroll
-                for (int i = 0; i < prefetch; i += 1) {
-#if __CUDA_ARCH__ == 610
-                    inners[i].x = __fmaf_rn(__half2float(codebook_ptr[reg_w[i][2*j]]),
-                            __half2float(reg_a[i][j].x),
-                            inners[i].x);
-                    inners[i].y = __fmaf_rn(__half2float(codebook_ptr[reg_w[i][2*j+1]]),
-                            __half2float(reg_a[i][j].y),
-                            inners[i].y);
-#else
-                    inners[i] = __hfma2(
-                            __halves2half2(codebook_ptr[reg_w[i][2*j]], codebook_ptr[reg_w[i][2*j+1]]),
-                            reg_a[i][j],
-                            inners[i]);
-#endif
-                }
-            }
-
-            act += prefetch * 8 * stride;
-            #pragma unroll
-            for (size_t i = 0; i < prefetch; i += 1) {
-                #pragma unroll
-                for (size_t j = 0; j < 8; j += 1) {
-                    reg_a[i][j] = act[(i*8+j)*stride];
-                }
-            }
-            #pragma unroll
-            for (int i = 0; i < prefetch; i += 1) {
-                #pragma unroll
-                for (size_t j = 0; j < 16; j += 1) {
-                    reg_w[i][j] = __funnelshift_l(reg_c[i].z, reg_c[i].y, 2*j);
-                }
-            }
-            #pragma unroll
-            for (int i = 0; i < prefetch; i += 1) {
-                #pragma unroll
-                for (size_t j = 0; j < 16; j += 1) {
-                    reg_w[i][j] &= mask;
-                }
-            }
-            #pragma unroll
-            for (size_t j = 0; j < 8; j += 1) {
-                #pragma unroll
-                for (int i = 0; i < prefetch; i += 1) {
-#if __CUDA_ARCH__ == 610
-                    inners[i].x = __fmaf_rn(__half2float(codebook_ptr[reg_w[i][2*j]]),
-                            __half2float(reg_a[i][j].x),
-                            inners[i].x);
-                    inners[i].y = __fmaf_rn(__half2float(codebook_ptr[reg_w[i][2*j+1]]),
-                            __half2float(reg_a[i][j].y),
-                            inners[i].y);
-#else
-                    inners[i] = __hfma2(
-                            __halves2half2(codebook_ptr[reg_w[i][2*j]], codebook_ptr[reg_w[i][2*j+1]]),
-                            reg_a[i][j],
-                            inners[i]);
-#endif
-                }
-            }
-
-            act += prefetch * 8 * stride;
-            #pragma unroll
-            for (size_t i = 0; i < prefetch; i += 1) {
-                #pragma unroll
-                for (size_t j = 0; j < 8; j += 1) {
-                    reg_a[i][j] = act[(i*8+j)*stride];
-                }
-            }
-            #pragma unroll
-            for (int i = 0; i < prefetch; i += 1) {
-                #pragma unroll
-                for (size_t j = 0; j < 16; j += 1) {
-                    reg_w[i][j] = __funnelshift_l(reg_c[i].w, reg_c[i].z, 2*j);
-                }
-            }
-            #pragma unroll
-            for (int i = 0; i < prefetch; i += 1) {
-                #pragma unroll
-                for (size_t j = 0; j < 16; j += 1) {
-                    reg_w[i][j] &= mask;
-                }
-            }
-            #pragma unroll
-            for (size_t j = 0; j < 8; j += 1) {
-                #pragma unroll
-                for (int i = 0; i < prefetch; i += 1) {
-#if __CUDA_ARCH__ == 610
-                    inners[i].x = __fmaf_rn(__half2float(codebook_ptr[reg_w[i][2*j]]),
-                            __half2float(reg_a[i][j].x),
-                            inners[i].x);
-                    inners[i].y = __fmaf_rn(__half2float(codebook_ptr[reg_w[i][2*j+1]]),
-                            __half2float(reg_a[i][j].y),
-                            inners[i].y);
-#else
-                    inners[i] = __hfma2(
-                            __halves2half2(codebook_ptr[reg_w[i][2*j]], codebook_ptr[reg_w[i][2*j+1]]),
-                            reg_a[i][j],
-                            inners[i]);
-#endif
-                }
-            }
-
-            #pragma unroll
-            for (int i = 0; i < prefetch; i += 1) {
-                carries[i] = __shfl_down_sync(FULL_MASK, reg_c[i].w, 31);  // only laneId == 0 is updated
+            for (size_t k = 0; k < 4; k += 1) {
+                inners[k] = __hfma2(reg_w[k][j].foo, reg_a[k][j], inners[k]);
             }
         }
 
-        for (size_t offset = 16; offset > 0; offset /= 2) {
-            #pragma unroll
-            for (int i = 0; i < prefetch; i += 1) {
-#if __CUDA_ARCH__ == 610
-                inners[i].x += __shfl_down_sync(FULL_MASK, inners[i].x, offset);
-                inners[i].y += __shfl_down_sync(FULL_MASK, inners[i].y, offset);
-#else
-                inners[i] = __hadd2(inners[i], __shfl_down_sync(FULL_MASK, inners[i], offset));
-#endif
-            }
-        }
+        carry = next_carry;
+    }
 
-        if (laneId == 0) {
-            if constexpr (warpsPerRow == 1) {
-                #pragma unroll
-                for (int i = 0; i < prefetch; i += 1) {
-#if __CUDA_ARCH__ == 610
-                    out[rowId] = __float2half(__half2float(out[rowId]) + inners[i].x + inners[i].y);
-#else
-                    half delta = __hadd(inners[i].x, inners[i].y);
-                    out[rowId] = __hadd(out[rowId], delta);
-#endif
-                }
-            } else {
-                #pragma unroll
-                for (int i = 0; i < prefetch; i += 1) {
-#if __CUDA_ARCH__ == 610
-                    static_assert(warpsPerRow == 1, "atomicAdd(half *, half) is not supported");
-#else
-                    atomicAdd(out + rowId, __hadd(inners[i].x, inners[i].y));
-#endif
-                }
-            }
-        }
+    half2 inner01 = __hadd2(inners[0], inners[1]);
+    half2 inner23 = __hadd2(inners[2], inners[3]);
+    half2 inner0123 = __hadd2(inner01, inner23);
+
+    for (size_t offset = 16; offset > 0; offset /= 2) {
+        inner0123 = __hadd2(inner0123, __shfl_down_sync(FULL_MASK, inner0123, offset));
+    }
+
+    if (laneId == 0) {
+        out[warpId] = __hadd(inner0123.x, inner0123.y);
     }
 }
 
@@ -475,14 +326,13 @@ __host__ static float decompress_matvec(
     static_assert(L <= 32, "Shift register length should not exceed 32 as the kernel uses uint32_t");
 
     CHECK_INPUT(compressed);
-    TORCH_CHECK(compressed.dim() == 2);
-    TORCH_CHECK(compressed.size(1) % (prefetch * warpsPerRow * 32 * 4) == 0); // 32 as in warpSize, 4 as in uint4
+    TORCH_CHECK(compressed.dim() == 3);
+    TORCH_CHECK(compressed.size(2) == 32 * 4);  // each warp reads an uint4
     TORCH_CHECK(compressed.scalar_type() == torch::kInt32);
 
-    size_t compressed_m = compressed.size(0);
-    size_t compressed_n = compressed.size(1);
-    size_t m = compressed_m;
-    size_t n = compressed_n * 16;   // at 2 bit, each uint32_t has 32 bits = 16 weights
+    size_t iters_per_thread = compressed.size(0);
+    size_t m = compressed.size(1);
+    size_t n = iters_per_thread * 32 * 4 * 16;
 
     CHECK_INPUT(codebook);
     TORCH_CHECK(codebook.dim() == 1);
@@ -499,11 +349,17 @@ __host__ static float decompress_matvec(
     TORCH_CHECK(out.size(0) == m);
     TORCH_CHECK(out.scalar_type() == torch::kFloat16);
 
-
-    cudaDeviceProp deviceProp;
-    cudaGetDeviceProperties(&deviceProp, compressed.get_device());
-    size_t grid_size = MIN_BLOCKS_PER_MP * static_cast<size_t>(deviceProp.multiProcessorCount);
     size_t block_size = MAX_THREADS_PER_BLOCK;
+    TORCH_CHECK(MAX_THREADS_PER_BLOCK % 32 == 0);
+    size_t warps_per_block = MAX_THREADS_PER_BLOCK / 32;
+    TORCH_CHECK(m % warps_per_block == 0);
+    size_t grid_size = m / warps_per_block; // each warp takes care of a row
+
+    gpuErrchk(cudaDeviceSetCacheConfig(cudaFuncCachePreferL1));
+    gpuErrchk(cudaFuncSetAttribute(
+                decompress_matvec_kernel<L>,
+                cudaFuncAttributePreferredSharedMemoryCarveout,
+                cudaSharedmemCarveoutMaxL1));
 
     cudaStream_t stream;
     gpuErrchk(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -515,13 +371,14 @@ __host__ static float decompress_matvec(
     gpuErrchk(cudaStreamSynchronize(stream));
     gpuErrchk(cudaEventRecord(start, stream));
 
-    decompress_matvec_kernel<L><<<grid_size, block_size, 0, stream>>>(
+    decompress_matvec_kernel<L><<<grid_size, block_size>>>(
         (half *)out.data_ptr<c10::Half>(),
-        (const uint32_t *)compressed.data_ptr<int32_t>(),
+        (const uint4 *)compressed.data_ptr<int32_t>(),
         (const half *)codebook.data_ptr<c10::Half>(),
-        (const half *)x.data_ptr<c10::Half>(),
-        compressed_m,
-        compressed_n);
+        (const half2 *)x.data_ptr<c10::Half>(),
+        iters_per_thread,
+        m,
+        n);
     
     gpuErrchk(cudaPeekAtLastError());
 
@@ -567,274 +424,20 @@ __host__ extern float decompress_matvec_8(
     return decompress_matvec<8>(compressed, codebook, x, out);
 }
 
-
-__global__ static void
-__launch_bounds__(MAX_THREADS_PER_BLOCK, MIN_BLOCKS_PER_MP)
-matvec_kernel(
-    half *__restrict__ out,
-    const half *__restrict__ decompressed,
-    const half *__restrict__ x,
-    size_t m,
-    size_t n
+__host__ extern float decompress_matvec_6(
+    torch::Tensor &compressed, torch::Tensor &codebook, torch::Tensor &x, torch::Tensor &out
 ) {
-    size_t threadId = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t laneId = threadIdx.x % warpSize;
-    size_t warpId = threadId / warpSize;
-    size_t warpCount = gridDim.x * blockDim.x / warpSize;
-    size_t stride = warpsPerRowMatvec * warpSize;
-
-    half2 reg_w[prefetchMatvec], reg_a[prefetchMatvec];
-    const half2 *act = reinterpret_cast<const half2 *>(x);
-
-    for (size_t rowId = warpId / warpsPerRowMatvec;
-            rowId < m;
-            rowId += warpCount / warpsPerRowMatvec) {
-        const half2 *row = reinterpret_cast<const half2 *>(decompressed + rowId * n);
-#if __CUDA_ARCH__ == 610
-        float2 inner = make_float2(0.0f, 0.0f);
-#else
-        half2 inner = __float2half2_rn(0.0f);
-#endif
-
-        for (size_t colId = threadId % stride;
-                colId < n / 2;
-                colId += prefetchMatvec * stride) {
-            #pragma unroll
-            for (size_t j = 0; j < prefetchMatvec; j += 1) {
-                reg_w[j] = row[colId + j * stride];
-                reg_a[j] = act[colId + j * stride];
-            }
-
-            #pragma unroll
-            for (size_t j = 0; j < prefetchMatvec; j += 1) {
-#if __CUDA_ARCH__ == 610
-                inner.x = __fmaf_rn(__half2float(reg_w[j].x),
-                        __half2float(reg_a[j].x),
-                        inner.x);
-                inner.y = __fmaf_rn(__half2float(reg_w[j].y),
-                        __half2float(reg_a[j].y),
-                        inner.y);
-#else
-                inner = __hfma2(reg_w[j], reg_a[j], inner);
-#endif
-            }
-        }
-
-        for (size_t offset = 16; offset > 0; offset /= 2) {
-#if __CUDA_ARCH__ == 610
-            inner.x += __shfl_down_sync(FULL_MASK, inner.x, offset);
-            inner.y += __shfl_down_sync(FULL_MASK, inner.y, offset);
-#else
-            inner = __hadd2(inner, __shfl_down_sync(FULL_MASK, inner, offset));
-#endif
-        }
-
-        if (laneId == 0) {
-            if constexpr (warpsPerRowMatvec == 1) {
-#if __CUDA_ARCH__ == 610
-                out[rowId] = __float2half(__half2float(out[rowId]) + inner.x + inner.y);
-#else
-                half delta = __hadd(inner.x, inner.y);
-                out[rowId] = __hadd(out[rowId], delta);
-#endif
-            } else {
-#if __CUDA_ARCH__ == 610
-                static_assert(warpsPerRowMatvec == 1, "atomicAdd(half *, half) is not supported");
-#else
-                atomicAdd(out + rowId, __hadd(inner.x, inner.y));
-#endif
-            }
-        }
-    }
+    return decompress_matvec<6>(compressed, codebook, x, out);
 }
 
-
-__host__ extern float matvec(
-    torch::Tensor &decompressed,
-    torch::Tensor &x,
-    torch::Tensor &out
+__host__ extern float decompress_matvec_4(
+    torch::Tensor &compressed, torch::Tensor &codebook, torch::Tensor &x, torch::Tensor &out
 ) {
-    CHECK_INPUT(decompressed);
-    TORCH_CHECK(decompressed.dim() == 2);
-    // 32 as in warpSize, 2 as in half2
-    TORCH_CHECK(decompressed.size(1) % (prefetchMatvec * warpsPerRowMatvec * 32 * 2) == 0);
-    TORCH_CHECK(decompressed.scalar_type() == torch::kFloat16);
-
-    size_t m = decompressed.size(0);
-    size_t n = decompressed.size(1);
-
-    CHECK_INPUT(x);
-    TORCH_CHECK(x.dim() == 1);
-    TORCH_CHECK(x.size(0) == n);
-    TORCH_CHECK(x.scalar_type() == torch::kFloat16);
-
-    CHECK_INPUT(out);
-    TORCH_CHECK(out.dim() == 1);
-    TORCH_CHECK(out.size(0) == m);
-    TORCH_CHECK(out.scalar_type() == torch::kFloat16);
-
-
-    cudaDeviceProp deviceProp;
-    cudaGetDeviceProperties(&deviceProp, decompressed.get_device());
-    size_t grid_size = MIN_BLOCKS_PER_MP * static_cast<size_t>(deviceProp.multiProcessorCount);
-    size_t block_size = MAX_THREADS_PER_BLOCK;
-
-    cudaStream_t stream;
-    gpuErrchk(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-
-    cudaEvent_t start, stop;
-    gpuErrchk(cudaEventCreate(&start));
-    gpuErrchk(cudaEventCreate(&stop));
-
-    gpuErrchk(cudaStreamSynchronize(stream));
-    gpuErrchk(cudaEventRecord(start, stream));
-
-    matvec_kernel<<<grid_size, block_size, 0, stream>>>(
-        (half *)out.data_ptr<c10::Half>(),
-        (const half *)decompressed.data_ptr<c10::Half>(),
-        (const half *)x.data_ptr<c10::Half>(),
-        m,
-        n);
-
-    gpuErrchk(cudaPeekAtLastError());
-
-    gpuErrchk(cudaEventRecord(stop, stream));
-    gpuErrchk(cudaEventSynchronize(stop));
-
-    float msecTotal = 0.0f;
-    gpuErrchk(cudaEventElapsedTime(&msecTotal, start, stop));
-
-    gpuErrchk(cudaEventDestroy(start));
-    gpuErrchk(cudaEventDestroy(stop));
-
-    return msecTotal;
+    return decompress_matvec<4>(compressed, codebook, x, out);
 }
 
-
-__global__ static void
-__launch_bounds__(MAX_THREADS_PER_BLOCK, MIN_BLOCKS_PER_MP)
-rowsum_kernel(
-    half *__restrict__ out,
-    const half *__restrict__ decompressed,
-    size_t m,
-    size_t n
+__host__ extern float decompress_matvec_2(
+    torch::Tensor &compressed, torch::Tensor &codebook, torch::Tensor &x, torch::Tensor &out
 ) {
-    size_t threadId = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t laneId = threadIdx.x % warpSize;
-    size_t warpId = threadId / warpSize;
-    size_t warpCount = gridDim.x * blockDim.x / warpSize;
-    size_t stride = warpsPerRowRowsum * warpSize;
-
-    half2 reg_w[prefetchRowsum];
-
-    for (size_t rowId = warpId / warpsPerRowRowsum;
-            rowId < m;
-            rowId += warpCount / warpsPerRowRowsum) {
-        const half2 *row = reinterpret_cast<const half2 *>(decompressed + rowId * n);
-#if __CUDA_ARCH__ == 610
-        float2 inner = make_float2(0.0f, 0.0f);
-#else
-        half2 inner = __float2half2_rn(0.0f);
-#endif
-
-        for (size_t colId = threadId % stride;
-                colId < n / 2;
-                colId += prefetchRowsum * stride) {
-            #pragma unroll
-            for (size_t j = 0; j < prefetchRowsum; j += 1) {
-                reg_w[j] = row[colId + j * stride];
-            }
-
-            #pragma unroll
-            for (size_t j = 0; j < prefetchRowsum; j += 1) {
-#if __CUDA_ARCH__ == 610
-                inner.x += __half2float(reg_w[j].x);
-                inner.y += __half2float(reg_w[j].y);
-#else
-                inner = __hadd2(inner, reg_w[j]);
-#endif
-            }
-        }
-
-        for (size_t offset = 16; offset > 0; offset /= 2) {
-#if __CUDA_ARCH__ == 610
-            inner.x += __shfl_down_sync(FULL_MASK, inner.x, offset);
-            inner.y += __shfl_down_sync(FULL_MASK, inner.y, offset);
-#else
-            inner = __hadd2(inner, __shfl_down_sync(FULL_MASK, inner, offset));
-#endif
-        }
-
-        if (laneId == 0) {
-            if constexpr (warpsPerRowRowsum == 1) {
-#if __CUDA_ARCH__ == 610
-                out[rowId] = __float2half(__half2float(out[rowId]) + inner.x + inner.y);
-#else
-                half delta = __hadd(inner.x, inner.y);
-                out[rowId] = __hadd(out[rowId], delta);
-#endif
-            } else {
-#if __CUDA_ARCH__ == 610
-                static_assert(warpsPerRowRowsum == 1, "atomicAdd(half *, half) is not supported");
-#else
-                atomicAdd(out + rowId, __hadd(inner.x, inner.y));
-#endif
-            }
-        }
-    }
-}
-
-
-__host__ extern float rowsum(
-    torch::Tensor &decompressed,
-    torch::Tensor &out
-) {
-    CHECK_INPUT(decompressed);
-    TORCH_CHECK(decompressed.dim() == 2);
-    // 32 as in warpSize, 2 as in half2
-    TORCH_CHECK(decompressed.size(1) % (prefetchRowsum * warpsPerRowRowsum * 32 * 2) == 0);
-    TORCH_CHECK(decompressed.scalar_type() == torch::kFloat16);
-
-    size_t m = decompressed.size(0);
-    size_t n = decompressed.size(1);
-
-    CHECK_INPUT(out);
-    TORCH_CHECK(out.dim() == 1);
-    TORCH_CHECK(out.size(0) == m);
-    TORCH_CHECK(out.scalar_type() == torch::kFloat16);
-
-
-    cudaDeviceProp deviceProp;
-    cudaGetDeviceProperties(&deviceProp, decompressed.get_device());
-    size_t grid_size = MIN_BLOCKS_PER_MP * static_cast<size_t>(deviceProp.multiProcessorCount);
-    size_t block_size = MAX_THREADS_PER_BLOCK;
-
-    cudaStream_t stream;
-    gpuErrchk(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-
-    cudaEvent_t start, stop;
-    gpuErrchk(cudaEventCreate(&start));
-    gpuErrchk(cudaEventCreate(&stop));
-
-    gpuErrchk(cudaStreamSynchronize(stream));
-    gpuErrchk(cudaEventRecord(start, stream));
-
-    rowsum_kernel<<<grid_size, block_size, 0, stream>>>(
-        (half *)out.data_ptr<c10::Half>(),
-        (const half *)decompressed.data_ptr<c10::Half>(),
-        m,
-        n);
-
-    gpuErrchk(cudaPeekAtLastError());
-
-    gpuErrchk(cudaEventRecord(stop, stream));
-    gpuErrchk(cudaEventSynchronize(stop));
-
-    float msecTotal = 0.0f;
-    gpuErrchk(cudaEventElapsedTime(&msecTotal, start, stop));
-
-    gpuErrchk(cudaEventDestroy(start));
-    gpuErrchk(cudaEventDestroy(stop));
-
-    return msecTotal;
+    return decompress_matvec<2>(compressed, codebook, x, out);
 }
