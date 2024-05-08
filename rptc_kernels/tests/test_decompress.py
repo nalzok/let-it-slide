@@ -8,7 +8,7 @@ def prepare_arguments(L, S, m, n, compressed_m, compressed_n):
                                dtype=torch.int32,
                                device="cuda").cuda()
     assert compressed.numel() == compressed_m * compressed_n
-    codebook = torch.ones((S,), dtype=torch.float16, device="cpu").cuda()
+    codebook = torch.ones((1<<S,), dtype=torch.float16, device="cpu").cuda()
     x = torch.randn((n,), dtype=torch.float16, device="cpu").cuda()
     out = torch.zeros((m,), dtype=torch.float16, device="cuda")     # some kernels require zero-initialization
     torch.cuda.empty_cache()
@@ -26,10 +26,9 @@ def benchmark():
     print(f"{m = }, {n = }, {memory_consumption = }")
 
     matvec_list = [
-        ("decompress_matvec_16_128", 16, 128, rptc_kernels.decompress_matvec_16_128),
-        ("decompress_matvec_16_64", 16, 64, rptc_kernels.decompress_matvec_16_64),
-        ("decompress_matvec_14_128", 14, 128, rptc_kernels.decompress_matvec_14_128),
-        ("decompress_matvec_14_64", 14, 64, rptc_kernels.decompress_matvec_14_64),
+        ("decompress_matvec_16_8", 16, 8, rptc_kernels.decompress_matvec_16_8),
+        ("decompress_matvec_16_7", 16, 7, rptc_kernels.decompress_matvec_16_7),
+        ("decompress_matvec_16_6", 16, 6, rptc_kernels.decompress_matvec_16_6),
     ]
 
     for name, L, S, decompress_matvec in matvec_list:

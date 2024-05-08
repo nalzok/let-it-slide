@@ -10,10 +10,18 @@ import optax
 from tqdm import trange
 
 
-def quantize(permuted_alphabet, corrections, samples, diag_only=True):
-    M, = permuted_alphabet.shape
-    L = M.bit_length() - 1
+def index_fn(x, L, S):
+    x = x * (2 * x + 1)
+    x ^= x >> (L-S)
+    x = x & ((1<<S)-1)
+    return x
+
+
+def quantize(alphabet, L, S, corrections, samples, diag_only=True):
     length = samples.shape[0]
+    permutation = jnp.arange(1<<L)
+    idx = index_fn(permutation, L, S)
+    permuted_alphabet = alphabet[idx]
 
     assert len(samples.shape) == 1, samples.shape
     assert len(corrections.shape) == 2, corrections.shape
@@ -23,12 +31,12 @@ def quantize(permuted_alphabet, corrections, samples, diag_only=True):
 
     def viterbi_step(carry, index):
         rho, prev_states = carry
-        prefixes = jnp.arange(M>>2)
+        prefixes = jnp.arange(1<<(L-2))
         discarded = jnp.arange(1<<2)
-        last_state = (discarded << (L-2)) | prefixes[..., jnp.newaxis]
+        last_state = (discarded<<(L-2)) | prefixes[..., jnp.newaxis]
 
         optimal_discarded = jnp.argmin(rho[last_state], axis=-1)
-        prev_state = (optimal_discarded << (L-2)) | prefixes
+        prev_state = (optimal_discarded<<(L-2)) | prefixes
         updated_prev_states = prev_states.at[index].set(prev_state)
         
         if diag_only:
@@ -45,7 +53,8 @@ def quantize(permuted_alphabet, corrections, samples, diag_only=True):
                 updated_error = error + corrections[index, idx] * (samples[idx] - permuted_alphabet[state])
                 return idx-1, updated_state, updated_error
 
-            negative_one, zero, error = jax.lax.while_loop(end, make_correction, (index, jnp.arange(M), jnp.zeros((M,))))
+            init_val = (index, jnp.arange(1<<L), jnp.zeros((1<<L,)))
+            negative_one, zero, error = jax.lax.while_loop(end, make_correction, init_val)
             # checkify.check(negative_one == -1, "negative_one should be -1, got {}", negative_one)
             # checkify.check(zero == 0, "zero should be 0, got {}", zero)
             additive_loss = error**2
@@ -54,9 +63,9 @@ def quantize(permuted_alphabet, corrections, samples, diag_only=True):
 
         return (updated_rho, updated_prev_states), None
 
-    rho = jnp.full((M,), jnp.inf)
+    rho = jnp.full((1<<L,), jnp.inf)
     rho = rho.at[0].set(0)  # initial state is zero (TODO: Tail-Biting)
-    prev_states = jnp.empty((length, M>>2), dtype=int)
+    prev_states = jnp.empty((length, 1<<(L-2)), dtype=int)
     (rho, prev_states), _ = jax.lax.scan(viterbi_step, (rho, prev_states), jnp.arange(length))
 
     def backtrack_input(state, prev_state):
@@ -71,12 +80,11 @@ def quantize(permuted_alphabet, corrections, samples, diag_only=True):
     return quantized, expected_loss
 
 
-def dequantize(permuted_alphabet, quantized):
-    M, = permuted_alphabet.shape
-
+def dequantize(alphabet, L, S, quantized):
     def f(state, input_):
-        next_state = (M-1) & ((state<<2) | input_)
-        output = permuted_alphabet[next_state]
+        next_state = (state<<2) | input_
+        idx = index_fn(next_state, L, S)
+        output = alphabet[idx]
         return next_state, output
 
     init_state = 0
@@ -85,9 +93,9 @@ def dequantize(permuted_alphabet, quantized):
     return dequantized
     
 
-def evaluate(permuted_alphabet, corrections, samples):
-    quantized, _ = quantize(permuted_alphabet, corrections, samples)
-    dequantized = dequantize(permuted_alphabet, quantized)
+def evaluate(alphabet, L, S, corrections, samples):
+    quantized, _ = quantize(alphabet, L, S, corrections, samples)
+    dequantized = dequantize(alphabet, L, S, quantized)
     residual = samples - dequantized
     mse = jnp.mean(residual**2)
 
@@ -98,18 +106,18 @@ def evaluate(permuted_alphabet, corrections, samples):
     return mse, entropy
 
 
-def train(key, permuted_alphabet, block_size, learning_rate, n_steps):
+def train(key, alphabet, L, S, block_size, learning_rate, n_steps):
 
     @jax.jit
-    def train_step(key_step, pab, opt_state):
+    def train_step(key_step, ab, opt_state):
         grad_fn = jax.value_and_grad(evaluate, has_aux=True)
         samples = jax.random.normal(key_step, (block_size,))
         corrections = jnp.eye(block_size)
-        (mse, entropy), grads = grad_fn(pab, corrections, samples)
-        updates, opt_state = gradient_transform.update(grads, opt_state, pab)
-        pab = optax.apply_updates(pab, updates)
+        (mse, entropy), grads = grad_fn(ab, L, S, corrections, samples)
+        updates, opt_state = gradient_transform.update(grads, opt_state, ab)
+        ab = optax.apply_updates(ab, updates)
 
-        return mse, entropy, pab, opt_state
+        return mse, entropy, ab, opt_state
 
     scheduler = optax.warmup_cosine_decay_schedule(
             init_value=0,
@@ -121,88 +129,49 @@ def train(key, permuted_alphabet, block_size, learning_rate, n_steps):
             optax.scale_by_schedule(scheduler),
             optax.scale(-1.0),
     )
-    opt_state = gradient_transform.init(permuted_alphabet)
+    opt_state = gradient_transform.init(alphabet)
 
     for step in (pbar := trange(n_steps)):
         key_step = jax.random.fold_in(key, step)
-        mse, entropy, permuted_alphabet, opt_state = train_step(key_step, permuted_alphabet, opt_state)
+        mse, entropy, alphabet, opt_state = train_step(key_step, alphabet, opt_state)
         pbar.set_description(f"{mse.item() = :.4f}, {entropy.item() = :.4f}")
 
-    return permuted_alphabet
+    return alphabet
 
 
-def main(block_size, learning_rate, n_steps):
-    L = 16
-    M = 1<<L
-
-    import numpy as np
-
+def main(L, S, block_size, learning_rate, n_steps):
     key = jax.random.PRNGKey(42)
-    key_perm, key_train, key_test = jax.random.split(key, num=3)
-    permutation = jax.random.permutation(key_perm, M)
-    permutation = jnp.arange(M)
-
-    # A New Class of Invertible Mappings, Theorem 3
-    # permutation = (permutation + ((permutation*permutation) | 0b10101)) & (M - 1)
-    # print(M, len(set(np.array(permutation))))
-
-    # https://github.com/skeeto/hash-prospector?tab=readme-ov-file#16-bit-hashes
-    # permutation ^= permutation >> 7
-    # permutation &= M - 1
-    # permutation *= 0x2993
-    # permutation &= M - 1
-    # permutation ^= permutation >> 5
-    # permutation &= M - 1
-    # permutation *= 0xe877
-    # permutation &= M - 1
-    # permutation ^= permutation >> 9
-    # permutation &= M - 1
-    # permutation *= 0x0235
-    # permutation &= M - 1
-    # permutation ^= permutation >> 10
-    # permutation &= M - 1
-
-    # RC6 function
-    permutation = permutation * (2*permutation+1)
-    permutation = permutation * 1664525 + 1013904223
-    permutation &= M - 1
-
-    print(permutation)
-    print(M, len(set(np.array(permutation))))
-
-    invperm = jnp.argsort(permutation)
-    alphabet_half = jnp.interp(jnp.linspace(0, 1, M//2),
-                               jnp.linspace(0, 1, 64),
-                               jsp.stats.norm.ppf(129/256 + jnp.arange(64)/128))
-    alphabet = jnp.concatenate([jnp.flipud(alphabet_half), -alphabet_half])
-
-    permuted_alphabet = alphabet[permutation]
-    print("Before:", permuted_alphabet[invperm])
+    key_train, key_test = jax.random.split(key)
+    alphabet_half = jsp.stats.norm.ppf(1/2 + 1/(1<<(S+1)) + jnp.arange(1<<(S-1))/(1<<S))
+    alphabet = jnp.concatenate([-jnp.flipud(alphabet_half), alphabet_half])
+    print("Before:", alphabet)
 
     samples = jax.random.normal(key_test, (2**20//block_size, block_size))
     corrections = jnp.eye(block_size)
 
-    mse_all, entropy_all = jax.lax.map(partial(evaluate, permuted_alphabet, corrections), samples)
+    mse_all, entropy_all = jax.lax.map(partial(evaluate, alphabet, L, S, corrections), samples)
     mse_mean = jnp.mean(mse_all).item()
     mse_std = jnp.std(mse_all).item()
     entropy_mean = jnp.mean(entropy_all).item()
     entropy_std = jnp.std(entropy_all).item()
     print(f"Before: {mse_mean = :.4f} ({mse_std:.3f}), {entropy_mean = :.4f} ({entropy_std:.3f})")
 
-    # fine-tine the alphabet; needs a lot of iterations to hit all symbols
-    permuted_alphabet = train(key_train, permuted_alphabet, block_size, learning_rate, n_steps)
-    print("After", permuted_alphabet[invperm])
-
-    mse_all, entropy_all = jax.lax.map(partial(evaluate, permuted_alphabet, corrections), samples)
-    mse_mean = jnp.mean(mse_all).item()
-    mse_std = jnp.std(mse_all).item()
-    entropy_mean = jnp.mean(entropy_all).item()
-    entropy_std = jnp.std(entropy_all).item()
-    print(f"After: {mse_mean = :.4f} ({mse_std:.3f}), {entropy_mean = :.4f} ({entropy_std:.3f})")
+    # fine-tine the alphabet
+    # alphabet = train(key_train, alphabet, L, S, block_size, learning_rate, n_steps)
+    # print("After:", alphabet)
+    #
+    # mse_all, entropy_all = jax.lax.map(partial(evaluate, alphabet, L, S, corrections), samples)
+    # mse_mean = jnp.mean(mse_all).item()
+    # mse_std = jnp.std(mse_all).item()
+    # entropy_mean = jnp.mean(entropy_all).item()
+    # entropy_std = jnp.std(entropy_all).item()
+    # print(f"After: {mse_mean = :.4f} ({mse_std:.3f}), {entropy_mean = :.4f} ({entropy_std:.3f})")
 
 
 if __name__ == "__main__":
+    L = 16
+    S = 6
     block_size = 2**10
     learning_rate = 1e-2
-    n_steps = 2**22
-    main(block_size, learning_rate, n_steps)
+    n_steps = 2**10
+    main(L, S, block_size, learning_rate, n_steps)
