@@ -44,11 +44,6 @@ __host__ static inline void gpuAssert(cudaError_t code, const char *file, int li
     }
 }
 
-typedef union __align__(4) alias_half_uint16 {
-    half2 foo;
-    uint16_t bar[2];
-} alias_half_uint16;
-
 
 __global__ static void
 __launch_bounds__(MAX_THREADS_PER_BLOCK)
@@ -171,63 +166,27 @@ __host__ extern float decompress(
 }
 
 
+__global__ static void
+__launch_bounds__(MAX_THREADS_PER_BLOCK)
+surfaceWriteKernel(uint4 *gIData, cudaSurfaceObject_t outputSurface) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    surf1Dwrite(gIData[idx], outputSurface, idx * sizeof(uint4));
+}
+
+
 template <size_t L>
 __global__ static void
 __launch_bounds__(MAX_THREADS_PER_BLOCK)
 decompress_matvec_kernel(
     half *__restrict__ out,
     const uint4 *__restrict__ compressed,
-    const half *__restrict__ codebook,
+    cudaTextureObject_t codebook,
     const half2 *__restrict__ x,
     size_t iters_per_thread,
     size_t m,
     size_t n
 ) {
-    const half *__restrict__ codebook_ptr = codebook;
-    if constexpr (L < 16) {
-        __shared__ half smem_codebook[1<<L];
-        size_t offset_quarter = 1<<(L-2);
-        // uint32_t *smem_x = reinterpret_cast<uint32_t *>(smem_codebook);
-        // uint32_t *smem_y = reinterpret_cast<uint32_t *>(smem_codebook + offset_quarter);
-        // uint32_t *smem_w = reinterpret_cast<uint32_t *>(smem_codebook + offset_quarter * 2);
-        // uint32_t *smem_z = reinterpret_cast<uint32_t *>(smem_codebook + offset_quarter * 3);
-
-        for (size_t idx = threadIdx.x; idx < (1<<L)/8; idx += blockDim.x) {
-            // read in uint4 from global memory, and then write in uint32_t into shared memory
-            uint4 quadruple = reinterpret_cast<const uint4 *>(codebook)[idx];
-            reinterpret_cast<uint4 *>(smem_codebook)[idx] = quadruple;
-            // asm("prefetchu.L1 [%0];" : : "l" (codebook + idx * 8));
-            // asm("prefetchu.L1 [%0];" : : "l" (codebook + idx * 8 + 1));
-            // asm("prefetchu.L1 [%0];" : : "l" (codebook + idx * 8 + 2));
-            // asm("prefetchu.L1 [%0];" : : "l" (codebook + idx * 8 + 3));
-            // asm("prefetchu.L1 [%0];" : : "l" (codebook + idx * 8 + 4));
-            // asm("prefetchu.L1 [%0];" : : "l" (codebook + idx * 8 + 5));
-            // asm("prefetchu.L1 [%0];" : : "l" (codebook + idx * 8 + 6));
-            // asm("prefetchu.L1 [%0];" : : "l" (codebook + idx * 8 + 7));
-            // uintptr_t ptr = reinterpret_cast<uintptr_t>(&codebook[idx]);
-            // if (ptr % 128 == 0) {
-            //     asm("prefetch.local.L1 [%0];" : : "l" (ptr));
-            // }
-            // asm("prefetch.global.L1 [%0];" : : "l" (codebook + idx * 8));
-            // asm("prefetch.global.L1 [%0];" : : "l" (codebook + idx * 8 + 1));
-            // asm("prefetch.global.L1 [%0];" : : "l" (codebook + idx * 8 + 2));
-            // asm("prefetch.global.L1 [%0];" : : "l" (codebook + idx * 8 + 3));
-            // asm("prefetch.global.L1 [%0];" : : "l" (codebook + idx * 8 + 4));
-            // asm("prefetch.global.L1 [%0];" : : "l" (codebook + idx * 8 + 5));
-            // asm("prefetch.global.L1 [%0];" : : "l" (codebook + idx * 8 + 6));
-            // asm("prefetch.global.L1 [%0];" : : "l" (codebook + idx * 8 + 7));
-            // smem_x[idx] = quadruple.x;
-            // smem_y[idx] = quadruple.y;
-            // smem_z[idx] = quadruple.z;
-            // smem_w[idx] = quadruple.w;
-        }
-        codebook_ptr = smem_codebook;
-    }
-
-    __syncthreads();
-
     constexpr uint16_t mask = (1<<L) - 1;
-    constexpr uint16_t lane_mask = mask & ~0b111110;
 
     size_t threadId = blockIdx.x * blockDim.x + threadIdx.x;
     size_t laneId = threadIdx.x % warpSize;
@@ -244,13 +203,7 @@ decompress_matvec_kernel(
     };
 
     for (size_t iter = 0; iter < iters_per_thread; iter += 1) {
-        // uint4 elem = compressed[iter * strideC + threadId];
-
-        uint4 elem;
-        asm volatile ("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(elem.x), "=r"(elem.y), "=r"(elem.z), "=r"(elem.w)
-                : "l" (compressed + iter * strideC + threadId));
-        // ld.global.nc.v4.u32     {%r427, %r428, %r429, %r430}, [%rd323];
+        uint4 elem = compressed[iter * strideC + threadId];
 
         // send w in lane X to carry in lane X+1, lane 0 not updated
         carry = __shfl_up_sync(FULL_MASK, elem.w, 1);
@@ -260,33 +213,25 @@ decompress_matvec_kernel(
 
         uint32_t reg_c[5] = { carry, elem.x, elem.y, elem.z, elem.w };
 
-        alias_half_uint16 reg_w[4][8];
+        half2 reg_w[4][8];
         half2 reg_a[4][8];
         #pragma unroll
         for (size_t k = 0; k < 4; k += 1) {
             #pragma unroll
             for (size_t j = 0; j < 8; j += 1) {
-                // TODO: would uint16_t be faster?
-                uint32_t state_x = (lane_mask & __funnelshift_l(reg_c[k+1], reg_c[k], 4*j)) | (laneId << 1);
-                uint32_t state_y = (lane_mask & __funnelshift_l(reg_c[k+1], reg_c[k], 4*j+2)) | (laneId << 1);
+                int16_t state_x = __funnelshift_l(reg_c[k+1], reg_c[k], 4*j);
+                int16_t state_y = __funnelshift_l(reg_c[k+1], reg_c[k], 4*j+2);
 
-                // state_x = state_x * (2*state_x+1);
-                // state_x = state_x * 1664525 + 1013904223;
-                // state_y = state_y * (2*state_y+1);
-                // state_y = state_y * 1664525 + 1013904223;
+                state_x = state_x * (2 * state_x + 1);
+                state_x = state_x * 1664525 + 1013904223;
+                state_y = state_y * (2 * state_y + 1);
+                state_y = state_y * 1664525 + 1013904223;
 
-                // reg_w[k][j].foo = __halves2half2(codebook_ptr[idx_x], codebook_ptr[idx_y]);
-                // TODO: Section 3.2 in https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=10318209
-                // reg_w[k][j].foo = h2cos(__halves2half2(
-                //     __float2half(sinf(__uint_as_float(idx_x))),
-                //     __float2half(fabsf(__uint_as_float(idx_y)))
-                // ));
-                asm volatile ("ld.global.nc.b16 %0, [%1];"
-                        : "=h"(reg_w[k][j].bar[0])
-                        : "l" (codebook_ptr + state_x));
-                asm volatile ("ld.global.nc.b16 %0, [%1];"
-                        : "=h"(reg_w[k][j].bar[1])
-                        : "l" (codebook_ptr + state_y));
+                constexpr float converter = 1.f / INT16_MAX;
+                reg_w[k][j] = __floats2half2_rn(
+                    tex1D<float>(codebook, state_x*converter),
+                    tex1D<float>(codebook, state_y*converter)
+                );
                 reg_a[k][j] = x[((iter * 4 + k) * 8 + j) * warpSize + laneId];
             }
         }
@@ -295,7 +240,7 @@ decompress_matvec_kernel(
         for (size_t j = 0; j < 8; j += 1) {
             #pragma unroll
             for (size_t k = 0; k < 4; k += 1) {
-                inners[k] = __hfma2(reg_w[k][j].foo, reg_a[k][j], inners[k]);
+                inners[k] = __hfma2(reg_w[k][j], reg_a[k][j], inners[k]);
             }
         }
 
@@ -316,14 +261,15 @@ decompress_matvec_kernel(
 }
 
 
-template <size_t L>
+template <size_t L, size_t S>
 __host__ static float decompress_matvec(
     torch::Tensor &compressed,
     torch::Tensor &codebook,
     torch::Tensor &x,
     torch::Tensor &out
 ) {
-    static_assert(L <= 32, "Shift register length should not exceed 32 as the kernel uses uint32_t");
+    static_assert(L <= 16, "Shift register length should not exceed 16 as the kernel uses int16_t");
+    static_assert(S % 8 == 0, "Codebook size must be divisible by 8 as the kernel copies one uint4 at a time");
 
     CHECK_INPUT(compressed);
     TORCH_CHECK(compressed.dim() == 3);
@@ -336,7 +282,7 @@ __host__ static float decompress_matvec(
 
     CHECK_INPUT(codebook);
     TORCH_CHECK(codebook.dim() == 1);
-    TORCH_CHECK(codebook.size(0) == 1<<L);
+    TORCH_CHECK(codebook.size(0) == S);
     TORCH_CHECK(codebook.scalar_type() == torch::kFloat16);
 
     CHECK_INPUT(x);
@@ -348,6 +294,35 @@ __host__ static float decompress_matvec(
     TORCH_CHECK(out.dim() == 1);
     TORCH_CHECK(out.size(0) == m);
     TORCH_CHECK(out.scalar_type() == torch::kFloat16);
+
+    // copy codebook to a cuArray (texture data source) using surface writes
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDescHalf();
+    cudaArray *cuArray;
+    cudaExtent extent = { .width = S, .height = 0, .depth = 0 };
+    gpuErrchk(cudaMalloc3DArray(&cuArray, &channelDesc, extent, cudaArraySurfaceLoadStore));
+
+    cudaSurfaceObject_t outputSurface;
+    cudaResourceDesc surfRes = {};
+    surfRes.resType = cudaResourceTypeArray;
+    surfRes.res.array.array = cuArray;
+
+    gpuErrchk(cudaCreateSurfaceObject(&outputSurface, &surfRes));
+    surfaceWriteKernel<<<1, S/8>>>(reinterpret_cast<uint4 *>(codebook.data_ptr<c10::Half>()), outputSurface);
+
+    cudaTextureObject_t tex_codebook;
+
+    cudaResourceDesc texRes = {};
+    texRes.resType = cudaResourceTypeArray;
+    texRes.res.array.array = cuArray;
+
+    cudaTextureDesc texDescr = {};
+    texDescr.normalizedCoords = true;
+    texDescr.filterMode = cudaFilterModeLinear;
+    texDescr.addressMode[0] = cudaAddressModeMirror;
+    texDescr.addressMode[1] = cudaAddressModeMirror;
+    texDescr.readMode = cudaReadModeElementType;
+
+    gpuErrchk(cudaCreateTextureObject(&tex_codebook, &texRes, &texDescr, NULL));
 
     size_t block_size = MAX_THREADS_PER_BLOCK;
     TORCH_CHECK(MAX_THREADS_PER_BLOCK % 32 == 0);
@@ -374,7 +349,7 @@ __host__ static float decompress_matvec(
     decompress_matvec_kernel<L><<<grid_size, block_size>>>(
         (half *)out.data_ptr<c10::Half>(),
         (const uint4 *)compressed.data_ptr<int32_t>(),
-        (const half *)codebook.data_ptr<c10::Half>(),
+        tex_codebook,
         (const half2 *)x.data_ptr<c10::Half>(),
         iters_per_thread,
         m,
@@ -391,53 +366,33 @@ __host__ static float decompress_matvec(
     gpuErrchk(cudaEventDestroy(start));
     gpuErrchk(cudaEventDestroy(stop));
 
+    gpuErrchk(cudaDestroySurfaceObject(outputSurface));
+    gpuErrchk(cudaDestroyTextureObject(tex_codebook));
+    gpuErrchk(cudaFreeArray(cuArray));
+
     return msecTotal;
 }
 
-__host__ extern float decompress_matvec_16(
+__host__ extern float decompress_matvec_16_128(
     torch::Tensor &compressed, torch::Tensor &codebook, torch::Tensor &x, torch::Tensor &out
 ) {
-    return decompress_matvec<16>(compressed, codebook, x, out);
+    return decompress_matvec<16, 128>(compressed, codebook, x, out);
 }
 
-__host__ extern float decompress_matvec_14(
+__host__ extern float decompress_matvec_16_64(
     torch::Tensor &compressed, torch::Tensor &codebook, torch::Tensor &x, torch::Tensor &out
 ) {
-    return decompress_matvec<14>(compressed, codebook, x, out);
+    return decompress_matvec<16, 64>(compressed, codebook, x, out);
 }
 
-__host__ extern float decompress_matvec_12(
+__host__ extern float decompress_matvec_14_128(
     torch::Tensor &compressed, torch::Tensor &codebook, torch::Tensor &x, torch::Tensor &out
 ) {
-    return decompress_matvec<12>(compressed, codebook, x, out);
+    return decompress_matvec<14, 128>(compressed, codebook, x, out);
 }
 
-__host__ extern float decompress_matvec_10(
+__host__ extern float decompress_matvec_14_64(
     torch::Tensor &compressed, torch::Tensor &codebook, torch::Tensor &x, torch::Tensor &out
 ) {
-    return decompress_matvec<10>(compressed, codebook, x, out);
-}
-
-__host__ extern float decompress_matvec_8(
-    torch::Tensor &compressed, torch::Tensor &codebook, torch::Tensor &x, torch::Tensor &out
-) {
-    return decompress_matvec<8>(compressed, codebook, x, out);
-}
-
-__host__ extern float decompress_matvec_6(
-    torch::Tensor &compressed, torch::Tensor &codebook, torch::Tensor &x, torch::Tensor &out
-) {
-    return decompress_matvec<6>(compressed, codebook, x, out);
-}
-
-__host__ extern float decompress_matvec_4(
-    torch::Tensor &compressed, torch::Tensor &codebook, torch::Tensor &x, torch::Tensor &out
-) {
-    return decompress_matvec<4>(compressed, codebook, x, out);
-}
-
-__host__ extern float decompress_matvec_2(
-    torch::Tensor &compressed, torch::Tensor &codebook, torch::Tensor &x, torch::Tensor &out
-) {
-    return decompress_matvec<2>(compressed, codebook, x, out);
+    return decompress_matvec<14, 64>(compressed, codebook, x, out);
 }
