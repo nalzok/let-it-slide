@@ -18,7 +18,7 @@
 using namespace torch::indexing;
 using namespace nvcuda;
 
-#define MAX_THREADS_PER_BLOCK 256
+#define MAX_THREADS_PER_BLOCK 1024
 
 #define FULL_MASK 0xFFFFFFFFU
 #define HALF_MASK 0x0000FFFFU
@@ -160,13 +160,13 @@ __host__ extern float decompress(
 }
 
 
-template <size_t L, size_t S>
+template <uint32_t L, uint32_t K, uint32_t V>
 __global__ static void
 __launch_bounds__(MAX_THREADS_PER_BLOCK)
 decompress_matvec_kernel(
     half *__restrict__ out,
     const uint4 *__restrict__ compressed,
-    const half *__restrict__ codebook,
+    const half2 *__restrict__ codebook,
     const half2 *__restrict__ x,
     size_t iters_per_thread,
     size_t m,
@@ -176,24 +176,16 @@ decompress_matvec_kernel(
     size_t laneId = threadIdx.x % warpSize;
     size_t warpId = threadId / warpSize;
     size_t strideC = blockDim.x * gridDim.x;
-    size_t strideX = warpSize * 4;
 
-    half local_w = codebook[laneId];    // FIXME: don't assume S = 5
-
-    // __shared__ half smem_codebook[1<<S];
-    // for (size_t idx = threadIdx.x; idx < 1<<S; idx += blockDim.x) {
-    //     smem_codebook[idx] = codebook[idx];
-    // }
-    // codebook = smem_codebook;
-    // __syncthreads();
+    __shared__ half2 smem[1<<(K+5)];
+    half2 *smem_codebook = smem + laneId;
+    for (size_t idx = threadIdx.x>>5; idx < 1<<K; idx += blockDim.x>>5) {
+        smem_codebook[idx<<5] = codebook[idx];
+    }
+    __syncthreads();
 
     uint32_t carry = 0U;
-    half2 inners[4] = {
-        __float2half2_rn(0.0f),
-        __float2half2_rn(0.0f),
-        __float2half2_rn(0.0f),
-        __float2half2_rn(0.0f),
-    };
+    half2 inner = __float2half2_rn(0.0f);
 
     for (size_t iter = 0; iter < iters_per_thread; iter += 1) {
         uint4 elem = compressed[iter * strideC + threadId];
@@ -204,71 +196,52 @@ decompress_matvec_kernel(
         // send w in lane 31 to carry in lane 0, lane 1-31 not updated
         uint32_t next_carry = __shfl_down_sync(FULL_MASK, elem.w, 31);
 
-        uint32_t reg_c[5] = { carry, elem.x, elem.y, elem.z, elem.w };
-
-        half2 reg_a[4][8];
-        half2 reg_w[4][8];
-        #pragma unroll
-        for (size_t k = 0; k < 4; k += 1) {
-            #pragma unroll
-            for (size_t j = 0; j < 8; j += 1) {
-                reg_a[k][j] = x[((iter * 4 + k) * 8 + j) * warpSize + laneId];
-                uint32_t idx_x = __funnelshift_l(reg_c[k+1], reg_c[k], 4*j);
-                uint32_t idx_y = idx_x >> 2;
-
-                half2 idx = make_half2(__ushort_as_half(idx_x), __ushort_as_half(idx_y));
-                idx = h2rcp(idx);
-
-                // idx_x = idx_x * (2*idx_x + 1);
-                // idx_x ^= idx_x >> (L-S);
-                //
-                // idx_y = idx_y * (2*idx_y + 1);
-                // idx_y ^= idx_y >> (L-S);
-
-                // half w_x = codebook[idx_x & ((1<<S)-1)];
-                // half w_y = codebook[idx_y & ((1<<S)-1)];
-                // half w_x = __ushort_as_half(idx_x);
-                // half w_y = __ushort_as_half(idx_y);
-                half w_x = __shfl_sync(FULL_MASK, local_w, __half_as_ushort(idx.x));
-                half w_y = __shfl_sync(FULL_MASK, local_w, __half_as_ushort(idx.y));
-                reg_w[k][j] = make_half2(w_x, w_y);
-            }
-        }
+        uint32_t reg_c[8] = {
+            __funnelshift_lc(elem.x, carry, 16), elem.x,
+            __funnelshift_lc(elem.y, elem.x, 16), elem.y,
+            __funnelshift_lc(elem.z, elem.y, 16), elem.z,
+            __funnelshift_lc(elem.w, elem.z, 16), elem.w
+        };
 
         #pragma unroll
-        for (size_t j = 0; j < 8; j += 1) {
+        for (uint32_t j = 0; j < 4; j += 1) {
             #pragma unroll
-            for (size_t k = 0; k < 4; k += 1) {
-                inners[k] = __hfma2(reg_w[k][j], reg_a[k][j], inners[k]);
+            for (uint32_t k = 0; k < 8; k += 1) {
+                half2 reg_a = x[((iter * 4 + j) * 8 + k) * warpSize + laneId];
+                uint32_t idx;
+                asm volatile ("bfe.u32 %0, %1, %2, %3;" : "=r"(idx) : "r"(reg_c[k]), "r"(16-4-4*j), "r"(L));
+                idx = idx * (2*idx+1);
+                idx = idx * 1664525 + 1013904223;
+                asm volatile ("bfe.u32 %0, %1, %2, %3;" : "=r"(idx) : "r"(idx), "r"(L-K), "r"(K));
+                half2 reg_w = smem_codebook[idx<<5];
+                inner = __hfma2(reg_w, reg_a, inner);
             }
         }
 
         carry = next_carry;
     }
 
-    half2 inner01 = __hadd2(inners[0], inners[1]);
-    half2 inner23 = __hadd2(inners[2], inners[3]);
-    half2 inner0123 = __hadd2(inner01, inner23);
-
     for (size_t offset = 16; offset > 0; offset /= 2) {
-        inner0123 = __hadd2(inner0123, __shfl_down_sync(FULL_MASK, inner0123, offset));
+        inner = __hadd2(inner, __shfl_down_sync(FULL_MASK, inner, offset));
     }
 
     if (laneId == 0) {
-        out[warpId] = __hadd(inner0123.x, inner0123.y);
+        out[warpId] = __hadd(inner.x, inner.y);
     }
 }
 
 
-template <size_t L, size_t S>
+template <uint32_t L, uint32_t K, uint32_t V>
 __host__ static float decompress_matvec(
     torch::Tensor &compressed,
     torch::Tensor &codebook,
     torch::Tensor &x,
     torch::Tensor &out
 ) {
-    static_assert(L <= 32, "Shift register length should not exceed 32 as the kernel uses uint32_t");
-    static_assert(L >= S, "Shift register state space must not be smaller than codebook size");
+    static_assert(L <= 16, "Shift register length should not exceed 16 as the kernel uses uint32_t");
+    static_assert(L >= K, "Shift register state space must not be smaller than codebook size");
+    static_assert(K + 5 + V + 1 <= 15, "We can only use 32 KiB shared memory");
+    static_assert(V == 1, "Quantize two weights at a time");
 
     CHECK_INPUT(compressed);
     TORCH_CHECK(compressed.dim() == 3);
@@ -281,7 +254,7 @@ __host__ static float decompress_matvec(
 
     CHECK_INPUT(codebook);
     TORCH_CHECK(codebook.dim() == 1);
-    TORCH_CHECK(codebook.size(0) == 1<<S);
+    TORCH_CHECK(codebook.size(0) == 1<<(K+V));
     TORCH_CHECK(codebook.scalar_type() == torch::kFloat16);
 
     CHECK_INPUT(x);
@@ -310,10 +283,10 @@ __host__ static float decompress_matvec(
     gpuErrchk(cudaStreamSynchronize(stream));
     gpuErrchk(cudaEventRecord(start, stream));
 
-    decompress_matvec_kernel<L, S><<<grid_size, block_size>>>(
+    decompress_matvec_kernel<L, K, V><<<grid_size, block_size>>>(
         (half *)out.data_ptr<c10::Half>(),
         (const uint4 *)compressed.data_ptr<int32_t>(),
-        (const half *)codebook.data_ptr<c10::Half>(),
+        (const half2 *)codebook.data_ptr<c10::Half>(),
         (const half2 *)x.data_ptr<c10::Half>(),
         iters_per_thread,
         m,
@@ -333,20 +306,8 @@ __host__ static float decompress_matvec(
     return msecTotal;
 }
 
-__host__ extern float decompress_matvec_16_8(
+__host__ extern float decompress_matvec_16_8_1(
     torch::Tensor &compressed, torch::Tensor &codebook, torch::Tensor &x, torch::Tensor &out
 ) {
-    return decompress_matvec<16, 8>(compressed, codebook, x, out);
-}
-
-__host__ extern float decompress_matvec_16_7(
-    torch::Tensor &compressed, torch::Tensor &codebook, torch::Tensor &x, torch::Tensor &out
-) {
-    return decompress_matvec<16, 7>(compressed, codebook, x, out);
-}
-
-__host__ extern float decompress_matvec_16_6(
-    torch::Tensor &compressed, torch::Tensor &codebook, torch::Tensor &x, torch::Tensor &out
-) {
-    return decompress_matvec<16, 6>(compressed, codebook, x, out);
+    return decompress_matvec<16, 8, 1>(compressed, codebook, x, out);
 }
