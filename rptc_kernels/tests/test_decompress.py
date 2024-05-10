@@ -26,7 +26,10 @@ def benchmark():
     print(f"{m = }, {n = }, {memory_consumption = }")
 
     matvec_list = [
+        ("decompress_matvec_16_6_1", 16, 6, 1, rptc_kernels.decompress_matvec_16_6_1),
+        ("decompress_matvec_20_6_1", 16, 6, 1, rptc_kernels.decompress_matvec_20_6_1),
         ("decompress_matvec_16_8_1", 16, 8, 1, rptc_kernels.decompress_matvec_16_8_1),
+        ("decompress_matvec_20_8_1", 16, 8, 1, rptc_kernels.decompress_matvec_20_8_1),
     ]
 
     for name, L, K, V, decompress_matvec in matvec_list:
