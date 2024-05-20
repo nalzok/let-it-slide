@@ -160,19 +160,33 @@ __host__ extern float decompress(
 }
 
 
-typedef union dummy {
+typedef union ditto {
     uint32_t u32;
     half2 f16x2;
-} dummy;
+} ditto;
 
 
-typedef union dummy4 {
+typedef union ditto2 {
+    unsigned long long ull;
+    uint64_t u64;
+    uint2 u32x2;
+    float2 f32x2;
+    uint32_t u32[2];
+    half2 f16x2[2];
+    half2 *ptr2f16x2;
+} ditto2;
+
+
+typedef union ditto4 {
     uint4 u32x4;
+    uint32_t u32[4];
+    float4 f32x4;
     half2 f16x2[4];
-} dummy4;
+    uint16_t u16[8];
+} ditto4;
 
 
-template <uint32_t L, uint32_t K, uint32_t V>
+template <uint32_t L, uint32_t S, uint32_t V>
 __global__ static void
 __launch_bounds__(MAX_THREADS_PER_BLOCK)
 decompress_matvec_kernel(
@@ -189,18 +203,18 @@ decompress_matvec_kernel(
     size_t warpId = threadId / warpSize;
     size_t strideC = blockDim.x * gridDim.x;
 
-    __shared__ __align__(1<<15) half2 smem_codebook[1<<(K+5)];
-    half2 *smem_codebook_ptr = smem_codebook + laneId;
-    for (size_t idx = threadIdx.x>>5; idx < 1<<(K-2); idx += blockDim.x>>5) {
-        dummy4 quadruple = { .u32x4 = reinterpret_cast<const uint4 *>(codebook)[idx] };
+    __shared__ __align__(1<<15) half2 smem_codebook[1<<(S+5)];
+    ditto2 smem_codebook_lane = { .ptr2f16x2 = smem_codebook + laneId };
+    for (size_t idx = threadIdx.x>>5; idx < 1<<(S-2); idx += blockDim.x>>5) {
+        ditto4 quadruple = { .u32x4 = reinterpret_cast<const uint4 *>(codebook)[idx] };
         for (uint32_t i = 0; i < 4; i += 1) {
-            smem_codebook_ptr[(idx<<7)|(i<<5)] = quadruple.f16x2[i];
+            smem_codebook_lane.ptr2f16x2[(idx<<7)|(i<<5)] = quadruple.f16x2[i];
         }
     }
 
     extern __shared__ half2 smem_x[];
     for (size_t idx = threadIdx.x; idx < n/8; idx += blockDim.x) {
-        dummy4 quadruple = { .u32x4 = reinterpret_cast<const uint4 *>(x)[idx] };
+        ditto4 quadruple = { .u32x4 = reinterpret_cast<const uint4 *>(x)[idx] };
         for (uint32_t i = 0; i < 4; i += 1) {
             smem_x[idx+i*(n/2/4)] = quadruple.f16x2[i];
         }
@@ -233,14 +247,19 @@ decompress_matvec_kernel(
             #pragma unroll
             for (uint32_t j = 0; j < 4; j += 1) {
                 half2 reg_a = smem_x_ptr[((iter * 8 + k) * 4 + j) * warpSize];
-                uint32_t idx;
-                asm volatile ("bfe.u32 %0, %1, %2, %3;" : "=r"(idx) : "r"(reg_c[k]), "r"(16-(1<<V)*2-4*j), "r"(L));
-                idx = idx * (idx+1);
-                idx = idx >> (L-K);
-                asm volatile ("bfe.u32 %0, %1, %2, %3;" : "=r"(idx) : "r"(idx), "r"(L-K), "r"(K));
-                dummy reg_w = { .f16x2 = smem_codebook_ptr[idx<<5] };
-                // FIXME: sign flip
-                // asm volatile ("lop3.b32 %0, %1, %2, %3, 0x40;" : "=r"(reg_w.u32) : "r"(reg_w.u32), "r"(idx), "r"(idx));
+                uint32_t hash = reg_c[k] >> (16-(1<<V)*2-4*j);
+                hash = hash * (hash+1);
+                uint32_t idx = hash >> 1;
+                constexpr uint32_t mask = ((1<<S)-1) << (5+V+1);
+                asm volatile ("lop3.b32 %0, %1, %2, %3, 0xCA;"
+                        : "=r"(smem_codebook_lane.u32[0])
+                        : "r"(mask), "r"(idx), "r"(smem_codebook_lane.u32[0]));
+                ditto reg_w = { .f16x2 = *smem_codebook_lane.ptr2f16x2 };
+                // sign flip
+                constexpr uint32_t toggle = 0b00000000'00000000'10000000'00000000;
+                asm volatile ("lop3.b32 %0, %1, %2, %3, 0xCA;"
+                        : "=r"(reg_w.u32)
+                        : "r"(toggle), "r"(hash), "r"(reg_w.u32));
                 inner = __hfma2(reg_w.f16x2, reg_a, inner);
             }
         }
@@ -258,7 +277,7 @@ decompress_matvec_kernel(
 }
 
 
-template <uint32_t L, uint32_t K, uint32_t V>
+template <uint32_t L, uint32_t S, uint32_t V>
 __host__ static float decompress_matvec(
     torch::Tensor &compressed,
     torch::Tensor &codebook,
@@ -266,9 +285,9 @@ __host__ static float decompress_matvec(
     torch::Tensor &out
 ) {
     static_assert(L - (1<<V)*2 <= 16, "Shift register should fit in uint32_t");
-    static_assert(L >= K, "Shift register state space must not be smaller than codebook size");
-    static_assert(K + V >= 3, "Codebook must have at least eight float16 elements as smem copy operates on uint4");
-    static_assert(K + 5 + V + 1 <= 15, "We can only use 32 KiB shared memory");
+    static_assert(L >= S, "Shift register state space must not be smaller than codebook size");
+    static_assert(S + V >= 3, "Codebook must have at least eight float16 elements as smem copy operates on uint4");
+    static_assert(S + 5 + V + 1 <= 15, "We can only use 32 KiB shared memory");
     static_assert(V == 1, "Quantize two weights at a time");
 
     CHECK_INPUT(compressed);
@@ -283,7 +302,7 @@ __host__ static float decompress_matvec(
 
     CHECK_INPUT(codebook);
     TORCH_CHECK(codebook.dim() == 1);
-    TORCH_CHECK(codebook.size(0) == 1<<(K+V));
+    TORCH_CHECK(codebook.size(0) == 1<<(S+V));
     TORCH_CHECK(codebook.scalar_type() == torch::kFloat16);
 
     CHECK_INPUT(x);
@@ -313,7 +332,7 @@ __host__ static float decompress_matvec(
     gpuErrchk(cudaEventRecord(start, stream));
 
     size_t smem_x_size = n * 2;
-    decompress_matvec_kernel<L, K, V><<<grid_size, block_size, smem_x_size>>>(
+    decompress_matvec_kernel<L, S, V><<<grid_size, block_size, smem_x_size>>>(
         reinterpret_cast<half *>(out.data_ptr<c10::Half>()),
         reinterpret_cast<const uint4 *>(compressed.data_ptr<int32_t>()),
         reinterpret_cast<const uint4 *>(codebook.data_ptr<c10::Half>()),
