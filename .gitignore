@@ -287,6 +287,17 @@ tags
 # End of https://www.toptal.com/developers/gitignore/api/linux,python,c,macos,vim
 
 .clangd
-**/report*.sqlite
-**/report*.nsys-rep
-**/*.nsight-cuprof-report
+report*.sqlite
+report*.nsys-rep
+*.nsight-cuprof-report
+*.ncu-rep
+*.cpp1.ii
+*.cpp4.ii
+*.cudafe1.c
+*.cudafe1.cpp
+*.cudafe1.gpu
+*.cudafe1.stub.c
+*.fatbin
+*.fatbin.c
+*.ptx
+*.sm_80.cubin
