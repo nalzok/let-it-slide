@@ -19,8 +19,8 @@ def prepare_arguments(L, K, V, m, n, compressed_m, compressed_n):
 def benchmark():
     torch.manual_seed(42)
 
-    compressed_m = 4096
-    compressed_n = 256
+    compressed_m = 8192
+    compressed_n = 512
     m, n = compressed_m, compressed_n * 16
     memory_consumption = compressed_m * compressed_n * 4
     print(f"{m = }, {n = }, {memory_consumption = }")
