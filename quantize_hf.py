@@ -44,7 +44,7 @@ hf_to_hessian = {
 
 
 model_to_hessian = {
-    "meta-llama/Llama-2-7b-hf": "/share/desa/nfs01/qs234/huggingface/hub/models--relaxml--Hessians-Llama-2-7b-6144/snapshots/cafc59c036c6416ec2a9d5790752bec51297c197/",
+    "meta-llama/Llama-2-7b-hf": "/mnt/desa_data/qingyao/.cache/huggingface/hub/models--relaxml--Hessians-Llama-2-7b-6144/snapshots/cafc59c036c6416ec2a9d5790752bec51297c197/",
 }
 
 
@@ -68,14 +68,14 @@ batch_quantize = jax.jit(jax.vmap(quantize, (None, None, 0)))
 batch_dequantize = jax.jit(jax.vmap(dequantize, (None, 0)))
 
 
-def round_weights(weights, corrections, permuted_alphabet):
+def round_weights(weights, importance, permuted_alphabet):
     rounded_weights = np.empty_like(weights)
 
     batch_size = 16
     for i in (pbar := trange((weights.shape[0]+batch_size-1) // batch_size, leave=False)):
         batch_index = slice(batch_size*i, batch_size*i+batch_size)
         rows = jnp.array(weights[batch_index])
-        quantized, expected_rho = batch_quantize(permuted_alphabet, corrections, rows)
+        quantized, expected_rho = batch_quantize(permuted_alphabet, importance, rows)
         rounded_weights[batch_index] = batch_dequantize(permuted_alphabet, quantized)
         pbar.set_description(str(jnp.mean(expected_rho)))
 
@@ -94,12 +94,11 @@ def quantize_model(model, hessian_root, permuted_alphabet):
             out_scales, normalized, in_scales = sinkhorn_knopp_factorize(weights)
 
             H = load_hessian(hessian_root, layer, hf_name)
-            U = torch.linalg.cholesky(H, upper=True)
-            corrections = jnp.array(U.T * in_scales)
+            importance = jnp.array(torch.diag(torch.diag(H) * np.ravel(in_scales)))
 
             # rng = np.random.default_rng(42)
             # permuted_alphabet = rng.choice(normalized.reshape(-1), size=1<<16, replace=False)
-            normalized_rounded = round_weights(normalized, corrections, permuted_alphabet)
+            normalized_rounded = round_weights(normalized, importance, permuted_alphabet)
             recon = out_scales * normalized_rounded * in_scales
             module.weight.copy_(torch.from_numpy(recon))
 
@@ -127,7 +126,7 @@ def main(model_name, shift_register_size, permuted_alphabet_path, quantized_root
     else:
         permuted_alphabet = jnp.load(permuted_alphabet_path)
 
-    model = AutoModelForCausalLM.from_pretrained(model_name, device_map="cpu")
+    model = AutoModelForCausalLM.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     with torch.inference_mode():
@@ -150,5 +149,5 @@ if __name__ == "__main__":
     model_name = "meta-llama/Llama-2-7b-hf"
     shift_register_size = 16
     permuted_alphabet_path = None
-    quantized_root = Path("/share/desa/nfs01/qs234/checkpoints/")
+    quantized_root = Path("/mnt/desa_data/qingyao/checkpoints/")
     main(model_name, shift_register_size, permuted_alphabet_path, quantized_root)
