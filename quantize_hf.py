@@ -16,26 +16,21 @@ def sinkhorn_knopp_factorize(M):
     MM = M**2
 
     def cond_fun(val):
-        _, _, residual, i = val
-        # return jnp.logical_and(residual > 1e-13, i < 32)
+        _, _, i = val
         return i < 32
 
     def body_fun(val):
-        c, r, _, i = val
+        c, r, i = val
         next_c = c * jnp.sum(MM / r / c, axis=0, keepdims=True)
         next_r = r * jnp.sum(MM / r / next_c, axis=1, keepdims=True)
-        maybe_doubly_stochastic = MM / next_r / next_c
-        row_sums = jnp.sum(maybe_doubly_stochastic, axis=0)
-        col_sums = jnp.sum(maybe_doubly_stochastic, axis=1)
-        next_residual = jnp.maximum(jnp.var(row_sums), jnp.var(col_sums))
         next_i = i + 1
-        return next_c, next_r, next_residual, next_i
+        return next_c, next_r, next_i
 
     out_features, in_features = M.shape
     c = jnp.ones((1, in_features))
     r = jnp.ones((out_features, 1))
-    init_val = c, r, jnp.inf, 0
-    c, r, _, _ = jax.lax.while_loop(cond_fun, body_fun, init_val)
+    init_val = c, r, 0
+    c, r, _ = jax.lax.while_loop(cond_fun, body_fun, init_val)
 
     out_scales = jnp.sqrt(r)
     in_scales = jnp.sqrt(c/in_features)
@@ -107,44 +102,57 @@ def load_quip(quip_root, layer, hf_name):
     return quip_hatW
 
 
-def round_weights(weights, importance, permuted_alphabet):
+def round_weights(key, weights, importance, shift_register_size):
     out_features, in_features = weights.shape
-    batch_size = 32
-    assert out_features % batch_size == 0
-    n = out_features // batch_size
-    weights_reshaped = jnp.reshape(weights, (n, batch_size, in_features))
+    num_banks = 32
+    batch_size = 8
+    assert out_features % (num_banks * batch_size) == 0, (out_features, num_banks, batch_size)
+    n = out_features // batch_size // num_banks
+    weights_reshaped = jnp.reshape(weights, (num_banks, n, batch_size, in_features))
 
-    def round_(batch):
-        batch_quantize = jax.vmap(quantize, (None, None, 0))
-        batch_dequantize = jax.vmap(dequantize, (None, 0))
-        quantized, _ = batch_quantize(permuted_alphabet, importance, batch)
-        rounded = batch_dequantize(permuted_alphabet, quantized)
-        return rounded
+    # TODO: sort rows by kurtosis
+    # TODO: block diagonal importance
+    # TODO: jax.random.fold_in
+    def round_megabatch(megabatch):
+        M = 1<<shift_register_size
+        x = (2*jnp.arange(M)+1)/2/M
+        xp = (2*jnp.arange(megabatch.size)+1)/2/megabatch.size
+        fp = jnp.sort(megabatch, axis=None)
+        alphabet = jnp.interp(x, xp, fp)
+        permuted_alphabet = jax.random.permutation(key, alphabet)
 
-    rounded_reshaped = jax.lax.map(round_, weights_reshaped)
+        def round_batch(batch):
+            batch_quantize = jax.vmap(quantize, (None, None, 0))
+            batch_dequantize = jax.vmap(dequantize, (None, 0))
+            quantized, _ = batch_quantize(permuted_alphabet, importance, batch)
+            rounded = batch_dequantize(permuted_alphabet, quantized)
+            return rounded
+
+        batch_rounded_reshaped = jax.lax.map(round_batch, megabatch)
+        return batch_rounded_reshaped
+
+    rounded_reshaped = jax.lax.map(round_megabatch, weights_reshaped)
     rounded = jnp.reshape(rounded_reshaped, (out_features, in_features))
 
     return rounded
 
 
-@partial(jax.jit, static_argnames=("shift_register_size",), donate_argnames=("W",))
+@partial(jax.jit, static_argnames=("shift_register_size",), donate_argnames=("quip_hatW",))
 def quantize_layer(key, H, W, quip_hatW, shift_register_size):
     scale = jnp.mean(W**2)**0.5
     frob_reference = jnp.sum(W**2)**0.5
     proxy_reference = jnp.sum((W @ H) * W)
 
+    quip_recon = quip_hatW * scale
+    quip_E = W - quip_recon
+    quip_frob = jnp.sum(quip_E**2) / frob_reference
+    quip_proxy = jnp.sum((quip_E @ H) * quip_E) / proxy_reference
+
     out_scales, normalized, in_scales = sinkhorn_knopp_factorize(W)
 
     importance = jnp.diag(jnp.diag(H) * jnp.ravel(in_scales))
 
-    M = 1<<shift_register_size
-    x = (2*jnp.arange(M)+1)/2/M
-    xp = (2*jnp.arange(jnp.size(W))+1)/2/jnp.size(W)
-    fp = jnp.sort(normalized, axis=None)
-    alphabet = jnp.interp(x, xp, fp)
-    permuted_alphabet = jax.random.permutation(key, alphabet)
-
-    normalized_rounded = round_weights(normalized, importance, permuted_alphabet)
+    normalized_rounded = round_weights(key, normalized, importance, shift_register_size)
     recon = out_scales * normalized_rounded * in_scales
 
     E = W - recon
@@ -152,12 +160,7 @@ def quantize_layer(key, H, W, quip_hatW, shift_register_size):
     frob = jnp.sum(E**2) / frob_reference
     proxy = jnp.sum((E @ H) * E) / proxy_reference
 
-    quip_recon = quip_hatW * scale
-    quip_E = W - quip_recon
-    quip_frob = jnp.sum(quip_E**2) / frob_reference
-    quip_proxy = jnp.sum((quip_E @ H) * quip_E) / proxy_reference
-
-    return recon, raw, frob, proxy, quip_frob, quip_proxy
+    return recon, quip_frob, quip_proxy, raw, frob, proxy
 
 
 def quantize_model(key, model, hessian_root, quip_root, shift_register_size):
@@ -173,28 +176,27 @@ def quantize_model(key, model, hessian_root, quip_root, shift_register_size):
             W = jnp.array(module.weight.numpy())
             quip_hatW = jnp.array(load_quip(quip_root, layer, hf_name))
 
-            recon, raw, frob, proxy, quip_frob, quip_proxy = quantize_layer(key_layer, H, W, quip_hatW, shift_register_size)
+            recon, quip_frob, quip_proxy, raw, frob, proxy = quantize_layer(key_layer, H, W, quip_hatW, shift_register_size)
+            del quip_hatW   # buffer donation
+
             module.weight.copy_(torch.from_numpy(np.array(recon)))
 
-            print(f"{layer=}, {hf_name=}, {raw=:g}, frob={frob:g}({quip_frob:g}), proxy={proxy:g}({quip_proxy:g})")
+            print(f"{layer=}, {hf_name=}, {raw=:g}, frob={frob:g}({frob/quip_frob:g}x), proxy={proxy:g}({proxy/quip_proxy:g}x)")
 
 
 def main(key, model_name, quantized_root, shift_register_size):
-    quantized_path = quantized_root / model_name
-    print(f"{quantized_path = }")
-
-    model = AutoModelForCausalLM.from_pretrained(model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-
     with torch.inference_mode():
+        model = AutoModelForCausalLM.from_pretrained(model_name)
         hessian_root = Path(model_to_hessian[model_name])
         quip_root = Path(model_to_quip[model_name])
         quantize_model(key, model, hessian_root, quip_root, shift_register_size)
 
+    quantized_path = quantized_root / model_name
     model.save_pretrained(quantized_path, safe_serialization=True)
 
     del model
 
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     quantized_model = AutoModelForCausalLM.from_pretrained(quantized_path, device_map="auto")
     input_text = "It is a truth universally acknowledged that "
     input_ids = tokenizer(input_text, return_tensors="pt").to("cuda")
@@ -206,6 +208,6 @@ def main(key, model_name, quantized_root, shift_register_size):
 if __name__ == "__main__":
     key = jax.random.PRNGKey(42)
     model_name = "meta-llama/Llama-2-7b-hf"
-    shift_register_size = 16
+    shift_register_size = 14
     quantized_root = Path("/mnt/desa_data/qingyao/checkpoints/")
     main(key, model_name, quantized_root, shift_register_size)
