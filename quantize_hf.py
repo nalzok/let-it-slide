@@ -11,34 +11,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from rptc import quantize, dequantize
 
 
-# TODO: debias
-def sinkhorn_knopp_factorize(M):
-    MM = M**2
-
-    def cond_fun(val):
-        _, _, i = val
-        return i < 32
-
-    def body_fun(val):
-        c, r, i = val
-        next_c = c * jnp.sum(MM / r / c, axis=0, keepdims=True)
-        next_r = r * jnp.sum(MM / r / next_c, axis=1, keepdims=True)
-        next_i = i + 1
-        return next_c, next_r, next_i
-
-    out_features, in_features = M.shape
-    c = jnp.ones((1, in_features))
-    r = jnp.ones((out_features, 1))
-    init_val = c, r, 0
-    c, r, _ = jax.lax.while_loop(cond_fun, body_fun, init_val)
-
-    out_scales = jnp.sqrt(r)
-    in_scales = jnp.sqrt(c/in_features)
-    normalized = M / out_scales / in_scales
-
-    return out_scales, normalized, in_scales
-
-
 hf_to_fused = {
     "q": "qkv",
     "k": "qkv",
@@ -102,6 +74,60 @@ def load_quip(quip_root, layer, hf_name):
     return quip_hatW
 
 
+def factorize(W):
+    # c.r. Sinkhorn-Knopp algorithm
+    # c.r. iterative proportional fitting
+    # c.r. iterative Bregman projection
+
+    def cond_fun(val):
+        _, _, _, _, i = val
+        return i < 64
+
+    def body_fun(val):
+        _, biases_in, scales_out, scales_in, i = val
+
+        next_biases_out = jnp.mean((W - biases_in) / scales_in, axis=1, keepdims=True) / jnp.mean(1/scales_in)
+        next_biases_in = jnp.mean((W - next_biases_out) / scales_out, axis=0, keepdims=True) / jnp.mean(1/scales_out)
+        bias_balancer = (jnp.mean(next_biases_in) - jnp.mean(next_biases_out)) / 2
+        next_biases_out += bias_balancer
+        next_biases_in -= bias_balancer
+
+        next_scales_out = jnp.sqrt(jnp.mean(((W - next_biases_out - next_biases_in) / scales_in)**2, axis=1, keepdims=True))
+        next_scales_in = jnp.sqrt(jnp.mean(((W - next_biases_out - next_biases_in) / next_scales_out)**2, axis=0, keepdims=True))
+        scale_balancer = jnp.exp((jnp.mean(jnp.log(next_scales_in)) - jnp.mean(jnp.log(next_scales_out))) / 2)
+        next_scales_out *= scale_balancer
+        next_scales_in /= scale_balancer
+
+        next_i = i + 1
+
+        next_val = next_biases_out, next_biases_in, next_scales_out, next_scales_in, next_i
+        return next_val
+
+    out_features, in_features = W.shape
+    biases_out = jnp.zeros((out_features, 1))
+    biases_in = jnp.zeros((1, in_features))
+    scales_out = jnp.ones((out_features, 1))
+    scales_in = jnp.ones((1, in_features))
+    init_val = biases_out, biases_in, scales_out, scales_in, 0
+
+    biases_out, biases_in, scales_out, scales_in, _ = jax.lax.while_loop(cond_fun, body_fun, init_val)
+
+    normalized = (W - biases_out - biases_in) / scales_out / scales_in
+
+    # recon = biases_out + biases_in + scales_out * scales_in * normalized
+    # jax.debug.print("distortion: {}", jnp.linalg.norm(W - recon))
+    # jax.debug.print("row sum: {}", jnp.mean(normalized, axis=0))
+    # jax.debug.print("col sum: {}", jnp.mean(normalized, axis=1))
+    # jax.debug.print("squared row sum: {}", jnp.mean(normalized**2, axis=0))
+    # jax.debug.print("squared col sum: {}", jnp.mean(normalized**2, axis=1))
+    # jax.debug.print("biases_out: {}", jnp.ravel(biases_out))
+    # jax.debug.print("biases_in: {}", jnp.ravel(biases_in))
+    # jax.debug.print("scales_out: {}", jnp.ravel(scales_out))
+    # jax.debug.print("scales_in: {}", jnp.ravel(scales_in))
+
+    return biases_out, biases_in, scales_out, scales_in, normalized
+
+
 def round_weights(key, weights, importance, shift_register_size):
     out_features, in_features = weights.shape
     num_banks = 32
@@ -148,12 +174,12 @@ def quantize_layer(key, H, W, quip_hatW, shift_register_size):
     quip_frob = jnp.sum(quip_E**2) / frob_reference
     quip_proxy = jnp.sum((quip_E @ H) * quip_E) / proxy_reference
 
-    out_scales, normalized, in_scales = sinkhorn_knopp_factorize(W)
+    biases_out, biases_in, scales_out, scales_in, normalized = factorize(W)
 
-    importance = jnp.diag(jnp.diag(H) * jnp.ravel(in_scales))
+    importance = jnp.diag(jnp.diag(H) * jnp.ravel(scales_in))
 
     normalized_rounded = round_weights(key, normalized, importance, shift_register_size)
-    recon = out_scales * normalized_rounded * in_scales
+    recon = biases_out + biases_in + scales_out * scales_in * normalized_rounded
 
     E = W - recon
     raw = jnp.mean((normalized-normalized_rounded)**2)
