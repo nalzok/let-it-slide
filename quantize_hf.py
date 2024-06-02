@@ -114,17 +114,6 @@ def factorize(W):
 
     normalized = (W - biases_out - biases_in) / scales_out / scales_in
 
-    # recon = biases_out + biases_in + scales_out * scales_in * normalized
-    # jax.debug.print("distortion: {}", jnp.linalg.norm(W - recon))
-    # jax.debug.print("row sum: {}", jnp.mean(normalized, axis=0))
-    # jax.debug.print("col sum: {}", jnp.mean(normalized, axis=1))
-    # jax.debug.print("squared row sum: {}", jnp.mean(normalized**2, axis=0))
-    # jax.debug.print("squared col sum: {}", jnp.mean(normalized**2, axis=1))
-    # jax.debug.print("biases_out: {}", jnp.ravel(biases_out))
-    # jax.debug.print("biases_in: {}", jnp.ravel(biases_in))
-    # jax.debug.print("scales_out: {}", jnp.ravel(scales_out))
-    # jax.debug.print("scales_in: {}", jnp.ravel(scales_in))
-
     return biases_out, biases_in, scales_out, scales_in, normalized
 
 
@@ -136,6 +125,10 @@ def round_weights(key, weights, importance, shift_register_size):
     n = out_features // batch_size // num_banks
     weights_reshaped = jnp.reshape(weights, (num_banks, n, batch_size, in_features))
 
+    # TODO: consider H when choosing alphabet
+    # TODO: Lloyd-Max Quantization
+    # TODO: https://ieeexplore.ieee.org/document/340468
+    # TODO: include more "outliers" and fewer small values
     # TODO: sort rows by kurtosis
     # TODO: block diagonal importance
     # TODO: jax.random.fold_in
@@ -163,30 +156,30 @@ def round_weights(key, weights, importance, shift_register_size):
     return rounded
 
 
-@partial(jax.jit, static_argnames=("shift_register_size",), donate_argnames=("quip_hatW",))
-def quantize_layer(key, H, W, quip_hatW, shift_register_size):
-    scale = jnp.mean(W**2)**0.5
-    frob_reference = jnp.sum(W**2)**0.5
-    proxy_reference = jnp.sum((W @ H) * W)
-
-    quip_recon = quip_hatW * scale
-    quip_E = W - quip_recon
-    quip_frob = jnp.sum(quip_E**2) / frob_reference
-    quip_proxy = jnp.sum((quip_E @ H) * quip_E) / proxy_reference
-
+@partial(jax.jit, static_argnames=("shift_register_size",))
+def quantize_layer(key, H, W, shift_register_size):
     biases_out, biases_in, scales_out, scales_in, normalized = factorize(W)
 
     importance = jnp.diag(jnp.diag(H) * jnp.ravel(scales_in))
 
     normalized_rounded = round_weights(key, normalized, importance, shift_register_size)
-    recon = biases_out + biases_in + scales_out * scales_in * normalized_rounded
+    ftcq_recon = biases_out + biases_in + scales_out * scales_in * normalized_rounded
+
+    return ftcq_recon
+
+
+@jax.jit
+def evaluate_layer(H, W, recon):
+    frob_reference = jnp.sum(W**2)**0.5
+    proxy_reference = jnp.sum((W @ H) * W)
+    proxy_diag_reference = jnp.sum((W * jnp.diag(H)) * W)
 
     E = W - recon
-    raw = jnp.mean((normalized-normalized_rounded)**2)
     frob = jnp.sum(E**2) / frob_reference
     proxy = jnp.sum((E @ H) * E) / proxy_reference
+    proxy_diag = jnp.sum((E * jnp.diag(H)) * E) / proxy_diag_reference
 
-    return recon, quip_frob, quip_proxy, raw, frob, proxy
+    return frob, proxy, proxy_diag
 
 
 def quantize_model(key, model, hessian_root, quip_root, shift_register_size):
@@ -200,33 +193,39 @@ def quantize_model(key, model, hessian_root, quip_root, shift_register_size):
 
             H = jnp.array(load_hessian(hessian_root, layer, hf_name))
             W = jnp.array(module.weight.numpy())
+
+            scale = jnp.mean(W**2)**0.5
             quip_hatW = jnp.array(load_quip(quip_root, layer, hf_name))
+            quip_recon = quip_hatW * scale
+            quip_frob, quip_proxy, quip_proxy_diag = evaluate_layer(H, W, quip_recon)
 
-            recon, quip_frob, quip_proxy, raw, frob, proxy = quantize_layer(key_layer, H, W, quip_hatW, shift_register_size)
-            del quip_hatW   # buffer donation
+            ftcq_recon = quantize_layer(key_layer, H, W, shift_register_size)
+            ftcq_frob, ftcq_proxy, ftcq_proxy_diag = evaluate_layer(H, W, ftcq_recon)
+            module.weight.copy_(torch.from_numpy(np.array(ftcq_recon)))
 
-            module.weight.copy_(torch.from_numpy(np.array(recon)))
+            print(f"{layer=}, {hf_name=}, "
+                  f"frob={ftcq_frob:g}({ftcq_frob/quip_frob:g}x), "
+                  f"proxy={ftcq_proxy:g}({ftcq_proxy/quip_proxy:g}x), "
+                  f"proxy_diag={ftcq_proxy_diag:g}({ftcq_proxy_diag/quip_proxy_diag:g}x)")
 
-            print(f"{layer=}, {hf_name=}, {raw=:g}, frob={frob:g}({frob/quip_frob:g}x), proxy={proxy:g}({proxy/quip_proxy:g}x)")
 
-
-def main(key, model_name, quantized_root, shift_register_size):
+def main(key, model_name, ftcq_root, shift_register_size):
     with torch.inference_mode():
         model = AutoModelForCausalLM.from_pretrained(model_name)
         hessian_root = Path(model_to_hessian[model_name])
         quip_root = Path(model_to_quip[model_name])
         quantize_model(key, model, hessian_root, quip_root, shift_register_size)
 
-    quantized_path = quantized_root / model_name
-    model.save_pretrained(quantized_path, safe_serialization=True)
+    ftcq_path = ftcq_root / model_name
+    model.save_pretrained(ftcq_path, safe_serialization=True)
 
     del model
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    quantized_model = AutoModelForCausalLM.from_pretrained(quantized_path, device_map="auto")
+    ftcq_model = AutoModelForCausalLM.from_pretrained(ftcq_path, device_map="auto")
     input_text = "It is a truth universally acknowledged that "
     input_ids = tokenizer(input_text, return_tensors="pt").to("cuda")
-    output = quantized_model.generate(**input_ids, max_new_tokens=128)
+    output = ftcq_model.generate(**input_ids, max_new_tokens=128)
     output_text = tokenizer.decode(output[0], skip_special_tokens=True)
     print(output_text)
 
@@ -235,5 +234,5 @@ if __name__ == "__main__":
     key = jax.random.PRNGKey(42)
     model_name = "meta-llama/Llama-2-7b-hf"
     shift_register_size = 14
-    quantized_root = Path("/mnt/desa_data/qingyao/checkpoints/")
-    main(key, model_name, quantized_root, shift_register_size)
+    ftcq_root = Path("/mnt/desa_data/qingyao/checkpoints/ftcq")
+    main(key, model_name, ftcq_root, shift_register_size)
