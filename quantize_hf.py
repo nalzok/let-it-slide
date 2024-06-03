@@ -160,6 +160,7 @@ def round_weights(key, weights, importance, shift_register_size):
 def quantize_layer(key, H, W, shift_register_size):
     biases_out, biases_in, scales_out, scales_in, normalized = factorize(W)
 
+    # TODO: jnp.sum(H, axis=-1) instead of jnp.diag(H)
     importance = jnp.diag(jnp.diag(H) * jnp.ravel(scales_in))
 
     normalized_rounded = round_weights(key, normalized, importance, shift_register_size)
@@ -173,18 +174,20 @@ def evaluate_layer(H, W, recon):
     frob_reference = jnp.sum(W**2)**0.5
     proxy_reference = jnp.sum((W @ H) * W)
     proxy_diag_reference = jnp.sum((W * jnp.diag(H)) * W)
+    proxy_sum_reference = jnp.sum((W * jnp.sum(H, axis=-1)) * W)
 
     E = W - recon
     frob = jnp.sum(E**2) / frob_reference
     proxy = jnp.sum((E @ H) * E) / proxy_reference
     proxy_diag = jnp.sum((E * jnp.diag(H)) * E) / proxy_diag_reference
+    proxy_sum = jnp.sum((E * jnp.sum(H, axis=-1)) * E) / proxy_sum_reference
 
-    return frob, proxy, proxy_diag
+    return frob, proxy, proxy_diag, proxy_sum
 
 
-def quantize_model(key, model, hessian_root, quip_root, shift_register_size):
+def quantize_model(key, full_model, hessian_root, quip_root, shift_register_size):
     pattern = re.compile(r"model\.layers\.(\d+)\.(self_attn\.(\w+)_proj|mlp\.(\w+)_proj)")
-    for i, (name, module) in enumerate(model.named_modules()):
+    for i, (name, module) in enumerate(full_model.named_modules()):
         match = re.fullmatch(pattern, name)
         if match is not None:
             layer = int(match.group(1))
@@ -194,32 +197,35 @@ def quantize_model(key, model, hessian_root, quip_root, shift_register_size):
             H = jnp.array(load_hessian(hessian_root, layer, hf_name))
             W = jnp.array(module.weight.numpy())
 
+            ftcq_recon = quantize_layer(key_layer, H, W, shift_register_size)
+            ftcq_frob, ftcq_proxy, ftcq_proxy_diag, ftcq_proxy_sum = evaluate_layer(H, W, ftcq_recon)
+
             scale = jnp.mean(W**2)**0.5
             quip_hatW = jnp.array(load_quip(quip_root, layer, hf_name))
             quip_recon = quip_hatW * scale
-            quip_frob, quip_proxy, quip_proxy_diag = evaluate_layer(H, W, quip_recon)
+            quip_frob, quip_proxy, quip_proxy_diag, quip_proxy_sum = evaluate_layer(H, W, quip_recon)
 
-            ftcq_recon = quantize_layer(key_layer, H, W, shift_register_size)
-            ftcq_frob, ftcq_proxy, ftcq_proxy_diag = evaluate_layer(H, W, ftcq_recon)
-            module.weight.copy_(torch.from_numpy(np.array(ftcq_recon)))
-
+            # TODO: is Hessian diagonal informative enough?
             print(f"{layer=}, {hf_name=}, "
                   f"frob={ftcq_frob:g}({ftcq_frob/quip_frob:g}x), "
                   f"proxy={ftcq_proxy:g}({ftcq_proxy/quip_proxy:g}x), "
-                  f"proxy_diag={ftcq_proxy_diag:g}({ftcq_proxy_diag/quip_proxy_diag:g}x)")
+                  f"proxy_diag={ftcq_proxy_diag:g}({ftcq_proxy_diag/quip_proxy_diag:g}x), "
+                  f"proxy_sum={ftcq_proxy_sum:g}({ftcq_proxy_sum/quip_proxy_sum:g}x)")
+
+            module.weight.copy_(torch.from_numpy(np.array(ftcq_recon)))
 
 
-def main(key, model_name, ftcq_root, shift_register_size):
+def main(key, model_name, shift_register_size, ftcq_root):
     with torch.inference_mode():
-        model = AutoModelForCausalLM.from_pretrained(model_name)
+        full_model = AutoModelForCausalLM.from_pretrained(model_name)
         hessian_root = Path(model_to_hessian[model_name])
         quip_root = Path(model_to_quip[model_name])
-        quantize_model(key, model, hessian_root, quip_root, shift_register_size)
+        quantize_model(key, full_model, hessian_root, quip_root, shift_register_size)
 
     ftcq_path = ftcq_root / model_name
-    model.save_pretrained(ftcq_path, safe_serialization=True)
+    full_model.save_pretrained(ftcq_path, safe_serialization=True)
 
-    del model
+    del full_model
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     ftcq_model = AutoModelForCausalLM.from_pretrained(ftcq_path, device_map="auto")
@@ -235,4 +241,4 @@ if __name__ == "__main__":
     model_name = "meta-llama/Llama-2-7b-hf"
     shift_register_size = 14
     ftcq_root = Path("/mnt/desa_data/qingyao/checkpoints/ftcq")
-    main(key, model_name, ftcq_root, shift_register_size)
+    main(key, model_name, shift_register_size, ftcq_root)
