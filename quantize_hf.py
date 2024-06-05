@@ -215,7 +215,7 @@ def quantize_model(key, full_model, hessian_root, quip_root, shift_register_size
             module.weight.copy_(torch.from_numpy(np.array(ftcq_recon)))
 
 
-def main(key, model_name, shift_register_size, ftcq_root):
+def main_quantize(key, model_name, shift_register_size, ftcq_root):
     with torch.inference_mode():
         full_model = AutoModelForCausalLM.from_pretrained(model_name)
         hessian_root = Path(model_to_hessian[model_name])
@@ -236,9 +236,65 @@ def main(key, model_name, shift_register_size, ftcq_root):
     print(output_text)
 
 
+def patch_model(full_model, ftcq_model, hessian_root, quip_root):
+    pattern = re.compile(r"model\.layers\.(\d+)\.(self_attn\.(\w+)_proj|mlp\.(\w+)_proj)")
+    for (full_name, full_module), (ftcq_name, ftcq_module) in zip(full_model.named_modules(), ftcq_model.named_modules()):
+        assert full_name == ftcq_name, (full_name, ftcq_name)
+        match = re.fullmatch(pattern, full_name)
+        if match is not None:
+            layer = int(match.group(1))
+            hf_name = match.group(3) or match.group(4)
+
+            H = jnp.array(load_hessian(hessian_root, layer, hf_name))
+            W = jnp.array(full_module.weight.numpy())
+
+            ftcq_recon = jnp.array(ftcq_module.weight.numpy())
+            ftcq_frob, ftcq_proxy, ftcq_proxy_diag, ftcq_proxy_sum = evaluate_layer(H, W, ftcq_recon)
+
+            scale = jnp.mean(W**2)**0.5
+            quip_hatW = jnp.array(load_quip(quip_root, layer, hf_name))
+            quip_recon = quip_hatW * scale
+            quip_frob, quip_proxy, quip_proxy_diag, quip_proxy_sum = evaluate_layer(H, W, quip_recon)
+
+            print(f"{layer=}, {hf_name=}, "
+                  f"frob={ftcq_frob:g}({ftcq_frob/quip_frob:g}x), "
+                  f"proxy={ftcq_proxy:g}({ftcq_proxy/quip_proxy:g}x), "
+                  f"proxy_diag={ftcq_proxy_diag:g}({ftcq_proxy_diag/quip_proxy_diag:g}x), "
+                  f"proxy_sum={ftcq_proxy_sum:g}({ftcq_proxy_sum/quip_proxy_sum:g}x)")
+
+            if ftcq_proxy_diag > quip_proxy_diag:
+                ftcq_module.weight.copy_(torch.from_numpy(np.array(quip_recon)))
+
+
+def main_patch(model_name, ftcq_root, patched_root):
+    with torch.inference_mode():
+        full_model = AutoModelForCausalLM.from_pretrained(model_name)
+        ftcq_path = ftcq_root / model_name
+        ftcq_model = AutoModelForCausalLM.from_pretrained(ftcq_path)
+        hessian_root = Path(model_to_hessian[model_name])
+        quip_root = Path(model_to_quip[model_name])
+        patch_model(full_model, ftcq_model, hessian_root, quip_root)
+
+    patched_path = patched_root / model_name
+    ftcq_model.save_pretrained(patched_path, safe_serialization=True)
+
+    del full_model, ftcq_model
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    patched_model = AutoModelForCausalLM.from_pretrained(patched_path, device_map="auto")
+    input_text = "It is a truth universally acknowledged that "
+    input_ids = tokenizer(input_text, return_tensors="pt").to("cuda")
+    output = patched_model.generate(**input_ids, max_new_tokens=128)
+    output_text = tokenizer.decode(output[0], skip_special_tokens=True)
+    print(output_text)
+
+
 if __name__ == "__main__":
     key = jax.random.PRNGKey(42)
     model_name = "meta-llama/Llama-2-7b-hf"
     shift_register_size = 14
-    ftcq_root = Path("/mnt/desa_data/qingyao/checkpoints/ftcq")
-    main(key, model_name, shift_register_size, ftcq_root)
+    ftcq_root = Path("/mnt/desa_data/qingyao/checkpoints/ftcq-sum")
+    main_quantize(key, model_name, shift_register_size, ftcq_root)
+
+    patched_root = Path("/mnt/desa_data/qingyao/checkpoints/patched")
+    main_patch(model_name, ftcq_root, patched_root)
